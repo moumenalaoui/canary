@@ -146,11 +146,16 @@ pub enum SignalingKind {
     /// Security-protected NAS: the body is ciphered or integrity-protected, so
     /// it was not decoded at all. See the module docs.
     ProtectedNas {
-        /// The security header type: 1..=3, from GSMTAP's `sub_type` when the
-        /// container claimed one and from the payload's own first octet
-        /// otherwise. The container's claim wins, so this is never the 0 of a
-        /// plain-looking header inside a frame that says it is protected — the
-        /// octet there is ciphertext, not a header.
+        /// The number that says the body is protected: GSMTAP's `sub_type` when
+        /// the container claimed one, and the payload's own security header type
+        /// (1, 2 or 3) otherwise. The container's claim wins, so this is never
+        /// the 0 of a plain-looking header inside a frame that says it is
+        /// protected — the octet there is ciphertext, not a header.
+        ///
+        /// A container's claim is reported as it was made, so a value outside
+        /// 1..=3 can appear here: whatever wrote the capture said it, and this
+        /// stage has nothing better to answer with. Only a number read from a
+        /// plain NAS header is a security header type in the spec's sense.
         security_header_type: u8,
     },
     /// NAS that is not EPS Mobility Management — typically EPS Session

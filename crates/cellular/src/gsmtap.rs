@@ -43,6 +43,16 @@ pub const NAS_SUBTYPE_PLAIN: u8 = 0x00;
 /// protected values (2 is integrity protected and ciphered, 3 ciphered with
 /// RRC signalling). A frame is protected for any non-zero value, so a reader
 /// that compared against this one alone would decode ciphertext as a header.
+///
+/// Wireshark's GSMTAP dissector draws its line differently, and this was
+/// measured rather than assumed: it dissects the NAS-EPS payload of a frame
+/// whose `sub_type` is 0 or 1, and does not call the payload NAS-EPS at all for
+/// 2 through 7. So tshark reports a message type for the protected container a
+/// `sub_type` of 1 names — reading the header inside a body the container says
+/// is protected — and reports nothing for the rest. Neither tool decodes a
+/// message type from a protected body here: CANARY counts those as protected
+/// events, which is the difference `scripts/oracle_compare.sh` shows frame by
+/// frame.
 pub const NAS_SUBTYPE_SECURE: u8 = 0x01;
 
 /// Smallest GSMTAP header: the fields above, i.e. `hdr_len` of 4 words.
