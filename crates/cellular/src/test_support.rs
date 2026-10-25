@@ -102,6 +102,10 @@ pub(crate) struct Recorded {
     pub micros: u32,
     /// The whole packet, link-layer payload and all.
     pub packet: Vec<u8>,
+    /// Which interface the record arrived on, for a pcapng file that describes
+    /// more than one. Ignored by the classic containers, which have no such
+    /// thing: their whole file is one link type.
+    pub interface: u32,
 }
 
 pub(crate) fn recorded(secs: u32, micros: u32, packet: Vec<u8>) -> Recorded {
@@ -109,6 +113,16 @@ pub(crate) fn recorded(secs: u32, micros: u32, packet: Vec<u8>) -> Recorded {
         secs,
         micros,
         packet,
+        interface: 0,
+    }
+}
+
+/// The same, on a named interface — so a test can say that this packet came in
+/// on the Ethernet interface of a two-interface capture.
+pub(crate) fn recorded_on(interface: u32, secs: u32, micros: u32, packet: Vec<u8>) -> Recorded {
+    Recorded {
+        interface,
+        ..recorded(secs, micros, packet)
     }
 }
 
@@ -186,6 +200,137 @@ fn push_u32(out: &mut Vec<u8>, value: u32, big_endian: bool) {
     } else {
         value.to_le_bytes()
     });
+}
+
+fn push_u64(out: &mut Vec<u8>, value: u64, big_endian: bool) {
+    out.extend_from_slice(&if big_endian {
+        value.to_be_bytes()
+    } else {
+        value.to_le_bytes()
+    });
+}
+
+/// pcapng block types this builder writes.
+const BLOCK_SECTION_HEADER: u32 = 0x0a0d_0d0a;
+const BLOCK_INTERFACE_DESCRIPTION: u32 = 1;
+const BLOCK_ENHANCED_PACKET: u32 = 6;
+
+/// How many bytes a pcapng block costs beyond its body: the type, the total
+/// length, and the total length repeated as the trailer.
+const BLOCK_OVERHEAD: u32 = 12;
+
+/// A pcapng file: one Section Header Block, one Interface Description Block per
+/// entry of `interfaces` (link type, `if_tsresol` exponent or `None` for the
+/// spec's default microsecond resolution), then one Enhanced Packet Block per
+/// record.
+///
+/// Written as bytes rather than with `pcap-file`'s own writer, for the reason
+/// stated at the top of this file: the crate's writer emits a timestamp in
+/// nanoseconds while declaring microsecond resolution, so a file built by it is
+/// a file the crate's own reader would misplace by a factor of 1000. Bytes from
+/// the spec are the thing tshark reads.
+fn pcapng_blocks(
+    records: &[Recorded],
+    interfaces: &[(u32, Option<u8>)],
+    big_endian: bool,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    // Section Header Block. The byte-order magic is written in the section's own
+    // order, which is what tells a reader which order that is: `1a 2b 3c 4d` on
+    // disk is big-endian, its reversal little.
+    let magic = if big_endian {
+        0x1a2b_3c4d_u32
+    } else {
+        0x4d3c_2b1a_u32
+    };
+    let mut body = Vec::new();
+    push_u32(&mut body, magic, big_endian);
+    push_u16(&mut body, 1, big_endian); // major_version
+    push_u16(&mut body, 0, big_endian); // minor_version
+    push_u64(&mut body, u64::MAX, big_endian); // section_length: -1, unspecified
+    push_block(&mut out, BLOCK_SECTION_HEADER, &body, big_endian);
+
+    // Interface Description Blocks.
+    for (linktype, ts_resol) in interfaces {
+        let mut body = Vec::new();
+        push_u16(&mut body, *linktype as u16, big_endian);
+        push_u16(&mut body, 0, big_endian); // reserved
+        push_u32(&mut body, 65535, big_endian); // snaplen
+        if let Some(resol) = ts_resol {
+            // if_tsresol (option 9): one octet, so three octets of padding.
+            push_u16(&mut body, 9, big_endian);
+            push_u16(&mut body, 1, big_endian);
+            body.push(*resol);
+            body.extend_from_slice(&[0, 0, 0]);
+            push_u16(&mut body, 0, big_endian); // opt_endofopt
+            push_u16(&mut body, 0, big_endian);
+        }
+        push_block(&mut out, BLOCK_INTERFACE_DESCRIPTION, &body, big_endian);
+    }
+
+    for record in records {
+        // The timestamp is one integer in the interface's own units, so the
+        // record's `micros` is scaled by whatever that interface declared.
+        let resol = interfaces
+            .get(record.interface as usize)
+            .and_then(|(_, resol)| *resol)
+            .unwrap_or(6);
+        let ticks = match resol {
+            6 => u64::from(record.secs) * 1_000_000 + u64::from(record.micros),
+            9 => u64::from(record.secs) * 1_000_000_000 + u64::from(record.micros) * 1_000,
+            other => panic!("no pcapng timestamp scale for if_tsresol {other}"),
+        };
+
+        let mut body = Vec::new();
+        push_u32(&mut body, record.interface, big_endian);
+        push_u32(&mut body, (ticks >> 32) as u32, big_endian);
+        push_u32(&mut body, ticks as u32, big_endian);
+        push_u32(&mut body, record.packet.len() as u32, big_endian); // captured_len
+        push_u32(&mut body, record.packet.len() as u32, big_endian); // original_len
+        body.extend_from_slice(&record.packet);
+        while body.len() % 4 != 0 {
+            body.push(0);
+        }
+        push_block(&mut out, BLOCK_ENHANCED_PACKET, &body, big_endian);
+    }
+
+    out
+}
+
+/// One pcapng block: type, total length, body, total length again.
+fn push_block(out: &mut Vec<u8>, block_type: u32, body: &[u8], big_endian: bool) {
+    let total = BLOCK_OVERHEAD + body.len() as u32;
+    push_u32(out, block_type, big_endian);
+    push_u32(out, total, big_endian);
+    out.extend_from_slice(body);
+    push_u32(out, total, big_endian);
+}
+
+/// A little-endian pcapng file whose one interface is `linktype`, with the
+/// default microsecond timestamps: what `rayhunter-check -P` writes.
+pub(crate) fn pcapng(records: &[Recorded], linktype: u32) -> Vec<u8> {
+    pcapng_blocks(records, &[(linktype, None)], false)
+}
+
+/// The same file in a big-endian section, the byte order the real capture from
+/// the Pi's toolchain happens to use.
+pub(crate) fn pcapng_big_endian(records: &[Recorded], linktype: u32) -> Vec<u8> {
+    pcapng_blocks(records, &[(linktype, None)], true)
+}
+
+/// A pcapng that declares nanosecond resolution with `if_tsresol`. The same
+/// instants as [`pcapng`], in units a reader that ignored the option would
+/// place 1000 away — which is precisely what `pcap-file` does, and why this
+/// front-end reads the option itself.
+pub(crate) fn pcapng_nanosecond(records: &[Recorded], linktype: u32) -> Vec<u8> {
+    pcapng_blocks(records, &[(linktype, Some(9))], false)
+}
+
+/// A pcapng carrying several interfaces, so a packet's own interface decides
+/// what its bytes mean.
+pub(crate) fn pcapng_interfaces(records: &[Recorded], interfaces: &[(u32, Option<u8>)]) -> Vec<u8> {
+    pcapng_blocks(records, interfaces, false)
 }
 
 /// The Internet checksum of RFC 1071, so the headers built here are valid

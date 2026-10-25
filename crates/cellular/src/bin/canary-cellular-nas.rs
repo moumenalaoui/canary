@@ -1,10 +1,13 @@
 //! Reconstruct the LTE NAS signaling sequence of a PCAP capture.
 //!
-//!     canary-cellular-nas <capture.pcap>
+//!     canary-cellular-nas <capture.pcap|capture.pcapng>
 //!
 //! Reads the capture as a stream — records are pulled off disk one at a time and
 //! dropped — and prints one line per NAS message, then the counts that make the
-//! sequence readable at a glance.
+//! sequence readable at a glance. Either container is read, and the `== container
+//! ==` table says which one the file turned out to be at the byte level: what
+//! `rayhunter-check -P` writes is pcapng, so a report that could not say so would
+//! leave the reader's own assumptions about the file in place of the file's.
 //!
 //! The per-kind and per-code tables are what the oracle comparison in `scripts/`
 //! diffs against `tshark`, so each is a count and then the thing counted, in a
@@ -28,7 +31,7 @@ use canary_cellular::nas_stream::{self, ParseError, StreamStats};
 use canary_cellular::signaling::SignalingKind;
 
 fn main() -> ExitCode {
-    const USAGE: &str = "usage: canary-cellular-nas <capture.pcap>";
+    const USAGE: &str = "usage: canary-cellular-nas <capture.pcap|capture.pcapng>";
 
     let mut args = std::env::args().skip(1);
     let Some(capture_path) = args.next() else {
@@ -216,6 +219,21 @@ fn write_stats<W: Write>(out: &mut W, stats: &StreamStats) -> std::io::Result<()
         stats.lte_nas_frames()
     )?;
 
+    // What the file said its packets were, rather than what this front-end was
+    // written assuming. One row per interface link type actually read, so a
+    // pcapng capture with two interfaces shows both, and a count of zero rows
+    // means the capture never got as far as stating one.
+    writeln!(out, "\n== container ==")?;
+    if stats.datalinks.is_empty() {
+        writeln!(out, "       0  no packet read, so no link type stated")?;
+    }
+    for (linktype, count) in &stats.datalinks {
+        match link_name(*linktype) {
+            "" => writeln!(out, "{count:>8}  link type {linktype}")?,
+            name => writeln!(out, "{count:>8}  link type {linktype} ({name})")?,
+        }
+    }
+
     writeln!(out, "\n== GSMTAP frame types ==")?;
     if stats.gsmtap_types.is_empty() {
         writeln!(out, "       0  no valid GSMTAP frame in this capture")?;
@@ -227,6 +245,21 @@ fn write_stats<W: Write>(out: &mut W, stats: &StreamStats) -> std::io::Result<()
         }
     }
     Ok(())
+}
+
+/// The name of a link type number, for the container table.
+///
+/// Both accepted numbers mean the same thing to this front-end — the packet
+/// begins at the IPv4 header — but they are not the same number, and which one a
+/// file used says something about the tool that wrote it. Anything else would be
+/// a name from a table this reader does not parse, so an unexpected number keeps
+/// its digits and gets no label, as [`type_name`] does.
+fn link_name(linktype: u32) -> &'static str {
+    match linktype {
+        101 => "DLT_RAW",
+        228 => "DLT_IPV4",
+        _ => "",
+    }
 }
 
 /// The name of a GSMTAP type, or an empty string for one this front-end has no
@@ -367,6 +400,8 @@ mod tests {
         let mut gsmtap_types = BTreeMap::new();
         gsmtap_types.insert(LTE_NAS_TYPE, 3u64);
         gsmtap_types.insert(0x11, 1u64);
+        let mut datalinks = BTreeMap::new();
+        datalinks.insert(101, 9u64); // DLT_RAW
         let stats = StreamStats {
             packets_read: 9,
             events: 3,
@@ -375,6 +410,7 @@ mod tests {
             skipped_malformed: 3,
             failed_records: 0,
             gsmtap_types,
+            datalinks,
         };
 
         let mut out = Vec::new();

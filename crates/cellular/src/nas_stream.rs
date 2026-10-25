@@ -35,6 +35,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, FixedOffset, Utc};
 use pcap_file::pcap::PcapReader;
+use pcap_file::pcapng::PcapNgReader;
+use pcap_file::pcapng::blocks::interface_description::{InterfaceDescriptionBlock, InterfaceDescriptionOption};
 use pcap_file::{DataLink, PcapError};
 use serde::{Deserialize, Serialize};
 
@@ -65,16 +67,25 @@ pub enum ParseError {
         #[source]
         source: std::io::Error,
     },
-    /// The capture is pcapng. Its block structure needs a different reader, and
-    /// `rayhunter-check -P` does not write it — reaching this means the file
-    /// came from somewhere else, Wireshark's default save format being the
-    /// common one.
-    #[error(
-        "capture is pcapng (block type {magic:#010x}); this front-end reads classic libpcap only"
-    )]
+    /// The capture is pcapng, and a block of it is not valid pcapng: a structure
+    /// that contradicts itself, an option whose length does not fit one, a block
+    /// type whose body this crate's parser does not accept. Everything before here
+    /// was delivered.
+    #[error("capture is not valid pcapng: {source}")]
     Pcapng {
-        /// The four bytes at the start of the file, big-endian.
-        magic: u32,
+        #[source]
+        source: PcapError,
+    },
+    /// A pcapng packet names an interface its section never described. The link
+    /// type and the timestamp resolution are both properties of that description,
+    /// so without it the packet's bytes have no meaning to be read: the file
+    /// contradicts itself, and which interface a packet belongs to is not a thing
+    /// to guess at. Terminal, because a broken index does not fix itself further
+    /// along in the same section.
+    #[error("packet references interface {interface}, which this section does not describe")]
+    UnknownInterface {
+        /// The `interface_id` field of the packet block.
+        interface: u32,
     },
     /// The file is not classic libpcap and not pcapng.
     #[error("capture is not a classic libpcap file (magic {magic:#010x})")]
@@ -155,6 +166,19 @@ pub struct StreamStats {
     /// numbering or the contents differ from what was assumed, instead of
     /// leaving a zero event count to be guessed at.
     pub gsmtap_types: BTreeMap<u8, u64>,
+    /// Packets read, counted by the link type of the interface they arrived on.
+    ///
+    /// The answer to "what did the container actually say", which is worth having
+    /// in writing whenever the capture came from someone else's tool: GSMTAP over
+    /// raw IPv4 is `228` or `101`, and a capture that reported `1` would be
+    /// Ethernet and never have been read at all.
+    ///
+    /// A pcapng file describes an interface per block and every packet says which
+    /// one it came in on, so this is a histogram rather than one number; a classic
+    /// file has exactly one entry, because its whole file is one link type. The
+    /// values sum to [`packets_read`](Self::packets_read) — a different cut of the
+    /// same total, not part of the events-and-skips partition.
+    pub datalinks: BTreeMap<u32, u64>,
 }
 
 impl StreamStats {
@@ -186,6 +210,117 @@ impl StreamStats {
 /// reader, so `pcap-file` sees a whole file without the reader needing `Seek`.
 type Source<R> = Chain<Cursor<Vec<u8>>, R>;
 
+/// Which container the capture turned out to be, and the reader for it.
+///
+/// Decided once, from the sniffed magic, and it decides two things that are not
+/// interchangeable: where a packet's bytes live (a record's payload, or the body
+/// of an Enhanced Packet Block) and which description says what those bytes mean
+/// — the whole file in the classic case, one interface per packet in pcapng's.
+enum CaptureReader<R: Read> {
+    /// Classic libpcap: one link type and one timestamp resolution for the file.
+    /// The link type is kept beside the reader because it is needed for every
+    /// packet and the header it came from borrows the reader to reach.
+    Classic {
+        reader: PcapReader<Source<R>>,
+        linktype: u32,
+    },
+    /// Pcapng: blocks, with a link type and a timestamp resolution per interface.
+    Pcapng { reader: PcapNgReader<Source<R>> },
+}
+
+/// The container a structural error came from, so the message can name the right
+/// spec: "not valid PCAP" sent someone to look in the wrong format's table.
+#[derive(Clone, Copy)]
+enum Format {
+    Classic,
+    Pcapng,
+}
+
+/// What one pull of [`CaptureReader::next_item`] produced.
+enum Chunk {
+    /// A packet: the link type of the interface it arrived on, the instant it was
+    /// seen, and its bytes, copied out of the reader's own buffer so that
+    /// counting and dissecting happen without a borrow on the reader.
+    Packet {
+        linktype: u32,
+        timestamp: Duration,
+        data: Vec<u8>,
+    },
+    /// A pcapng block that is not a packet: a section's header, an interface
+    /// description, a name-resolution or statistics block. Nothing to dissect, and
+    /// not a packet, so it is not counted as one.
+    Block,
+    /// The capture ended.
+    End,
+}
+
+impl<R: Read> CaptureReader<R> {
+    /// What the container declares about link types before a single packet: a
+    /// classic file gives one number for the whole file, and a pcapng file gives
+    /// one per interface in blocks that may not have been reached yet — `None`
+    /// there means "not stated yet", which is why the packet path is where a
+    /// pcapng refusal happens.
+    fn declared_linktype(&self) -> Option<u32> {
+        match self {
+            CaptureReader::Classic { linktype, .. } => Some(*linktype),
+            CaptureReader::Pcapng { .. } => None,
+        }
+    }
+
+    /// Pull the next item out of whichever container is open.
+    ///
+    /// A link type is checked here rather than at open, because in pcapng the
+    /// description of an interface is itself a block that has not necessarily been
+    /// read yet — at open there is nothing to check. A classic file does have a
+    /// global header, so `nas_events` refuses a wrong one before any packet is
+    /// read, and the check here is the same rule stated once for both paths.
+    fn next_item(&mut self) -> Result<Chunk, ParseError> {
+        match self {
+            CaptureReader::Classic { reader, linktype } => match reader.next_packet() {
+                None => Ok(Chunk::End),
+                Some(Err(source)) => Err(pcap_error(source, Format::Classic)),
+                Some(Ok(packet)) => Ok(Chunk::Packet {
+                    linktype: *linktype,
+                    timestamp: packet.timestamp,
+                    data: packet.data.into_owned(),
+                }),
+            },
+            CaptureReader::Pcapng { reader } => loop {
+                let Some(block) = reader.next_block() else {
+                    return Ok(Chunk::End);
+                };
+                let block = block.map_err(|source| pcap_error(source, Format::Pcapng))?;
+                let Some(packet) = block.into_enhanced_packet() else {
+                    continue;
+                };
+
+                // Everything the interface description is needed for is copied out
+                // first: the packet's bytes borrow the crate's read buffer, and
+                // reading the interface list is a second borrow of the same reader.
+                let interface_id = packet.interface_id;
+                let timestamp = packet.timestamp;
+                let data = packet.data.to_vec();
+
+                let Some(interface) = reader.interfaces().get(interface_id as usize) else {
+                    return Err(ParseError::UnknownInterface {
+                        interface: interface_id,
+                    });
+                };
+                let linktype = u32::from(interface.linktype);
+                if !matches!(interface.linktype, DataLink::RAW | DataLink::IPV4) {
+                    return Err(ParseError::UnsupportedLinkType { linktype });
+                }
+
+                return Ok(Chunk::Packet {
+                    linktype,
+                    timestamp: pcapng_timestamp(timestamp, interface),
+                    data,
+                });
+            },
+        }
+    }
+}
+
 /// A streaming iterator over the NAS events of one capture.
 ///
 /// Built by [`nas_events`]. The stream ends after the first terminal error, and
@@ -193,13 +328,19 @@ type Source<R> = Chain<Cursor<Vec<u8>>, R>;
 /// reports how far it got.
 pub struct NasStream<R: Read> {
     /// `None` once the stream has ended, or when it never started.
-    source: Option<PcapReader<Source<R>>>,
+    source: Option<CaptureReader<R>>,
     /// Set when the stream will yield nothing more.
     closed: bool,
     /// An error to yield before ending: the failures found before the first
     /// record, i.e. wrong format, wrong link type, unreadable magic.
     pending: Option<ParseError>,
     stats: StreamStats,
+    /// The link type the capture's packets are read as, as soon as the container
+    /// says. A classic file says it in the global header, so it is known before
+    /// the first record; a pcapng file says it per interface, in a block that has
+    /// not necessarily been reached, so the first packet is the earliest it can be
+    /// answered. `None` throughout for a capture that was refused.
+    linktype: Option<u32>,
 }
 
 impl<R: Read> NasStream<R> {
@@ -210,6 +351,7 @@ impl<R: Read> NasStream<R> {
             closed: false,
             pending: Some(error),
             stats: StreamStats::default(),
+            linktype: None,
         }
     }
 
@@ -219,17 +361,21 @@ impl<R: Read> NasStream<R> {
         &self.stats
     }
 
-    /// The link type number from the global header, when one was readable.
-    /// Useful in an error message: "this capture is Ethernet" is worth saying
-    /// even when the reader was refused.
+    /// The link type the capture's packets are read as, when the container had
+    /// said: the global header of a classic file at open, the first packet's
+    /// interface of a pcapng one. Useful in a report, and useful in an error —
+    /// "this capture is Ethernet" is worth saying even after the reader was
+    /// refused, which is what [`ParseError::UnsupportedLinkType`] carries.
+    ///
+    /// A pcapng file that reads packets on more than one interface reports the
+    /// first of them here; [`StreamStats::datalinks`] counts them all.
     pub fn linktype(&self) -> Option<u32> {
-        self.source
-            .as_ref()
-            .map(|reader| u32::from(reader.header().datalink))
+        self.linktype
     }
 }
 
-/// Reconstruct the LTE NAS signaling sequence from a classic PCAP capture.
+/// Reconstruct the LTE NAS signaling sequence from a capture in either PCAP
+/// container.
 ///
 /// Takes a [`Read`] rather than a path: the same code serves a file, a pipe, and
 /// a byte source that cannot seek. Records are consumed lazily and dropped, so
@@ -237,8 +383,8 @@ impl<R: Read> NasStream<R> {
 ///
 /// Format problems come through the iterator rather than through this function's
 /// return type, because the shape asked for is an iterator: a capture that turns
-/// out not to be libpcap yields one `Err` item and ends, which the caller sees
-/// on its very first `next()` either way.
+/// out not to be a container this front-end reads yields one `Err` item and ends,
+/// which the caller sees on its very first `next()` either way.
 pub fn nas_events<R: Read>(reader: R) -> NasStream<R> {
     let mut source = reader;
     let mut buffer = [0u8; MAGIC_LEN];
@@ -256,35 +402,48 @@ pub fn nas_events<R: Read>(reader: R) -> NasStream<R> {
     // Zero-filled past whatever was readable, so a short file still reports its
     // real leading bytes as the magic.
     let magic = u32::from_be_bytes(buffer);
-    if filled < MAGIC_LEN || !CLASSIC_MAGICS.contains(&magic) {
-        return NasStream::failed(if magic == PCAPNG_SECTION_HEADER {
-            ParseError::Pcapng { magic }
-        } else {
-            ParseError::NotClassicPcap { magic }
-        });
-    }
-
-    // Hand the magic back to `pcap-file`, which expects to read it itself.
+    // Hand the magic back to `pcap-file`, which expects to read it itself: both
+    // readers parse their own header, and neither can be handed a reader that has
+    // already swallowed the first four bytes.
     let chained = Cursor::new(buffer[..filled].to_vec()).chain(source);
-    let reader = match PcapReader::new(chained) {
-        Ok(reader) => reader,
-        Err(source) => return NasStream::failed(pcap_error(source)),
+    let source = if CLASSIC_MAGICS.contains(&magic) {
+        let reader = match PcapReader::new(chained) {
+            Ok(reader) => reader,
+            Err(source) => return NasStream::failed(pcap_error(source, Format::Classic)),
+        };
+
+        // 101 (`DLT_RAW`) and 228 (`DLT_IPV4`) both mean "the packet begins at
+        // the IPv4 header", which is all this front-end needs. Accepting both is
+        // free and covers the two ways a raw-IPv4 capture gets written: the QMDL
+        // converters use 101, while a writer that reaches for an IPv4 datalink
+        // constant emits 228 — which is what `rayhunter-check -P` writes. Keying
+        // on only one would reject a real capture.
+        let datalink = reader.header().datalink;
+        if !matches!(datalink, DataLink::RAW | DataLink::IPV4) {
+            return NasStream::failed(ParseError::UnsupportedLinkType {
+                linktype: u32::from(datalink),
+            });
+        }
+
+        CaptureReader::Classic {
+            reader,
+            linktype: u32::from(datalink),
+        }
+    } else if magic == PCAPNG_SECTION_HEADER {
+        // Nothing to refuse yet: a pcapng file's interfaces are described by the
+        // blocks after the section header, so a link type exists to check only at
+        // the first packet, where `next_item` looks it up.
+        match PcapNgReader::new(chained) {
+            Ok(reader) => CaptureReader::Pcapng { reader },
+            Err(source) => return NasStream::failed(pcap_error(source, Format::Pcapng)),
+        }
+    } else {
+        return NasStream::failed(ParseError::NotClassicPcap { magic });
     };
 
-    // 101 (`DLT_RAW`) and 228 (`DLT_IPV4`) both mean "the packet begins at the
-    // IPv4 header", which is all this front-end needs. Accepting both is free
-    // and covers the two ways a raw-IPv4 capture gets written: the QMDL
-    // converters use 101, while a writer that reaches for an IPv4 datalink
-    // constant emits 228. Keying on only one would reject a real capture.
-    let datalink = reader.header().datalink;
-    if !matches!(datalink, DataLink::RAW | DataLink::IPV4) {
-        return NasStream::failed(ParseError::UnsupportedLinkType {
-            linktype: u32::from(datalink),
-        });
-    }
-
     NasStream {
-        source: Some(reader),
+        linktype: source.declared_linktype(),
+        source: Some(source),
         closed: false,
         pending: None,
         stats: StreamStats::default(),
@@ -303,68 +462,174 @@ impl<R: Read> Iterator for NasStream<R> {
             return Some(Err(error));
         }
 
-        // `reader` borrows the `source` field only, which is what lets the
-        // packet it yields coexist with updates to `stats` and `closed`.
-        let reader = self.source.as_mut()?;
-
         loop {
-            let packet = match reader.next_packet() {
+            // The item is taken out of the reader here, so the borrow of `self`
+            // ends before anything is counted or dissected below.
+            let item = match self.source.as_mut() {
                 None => {
                     self.closed = true;
                     return None;
                 }
-                Some(Err(source)) => {
-                    self.closed = true;
-                    return Some(Err(pcap_error(source)));
-                }
-                Some(Ok(packet)) => packet,
+                Some(reader) => reader.next_item(),
             };
 
+            let (linktype, timestamp, data) = match item {
+                Err(error) => {
+                    self.closed = true;
+                    return Some(Err(error));
+                }
+                Ok(Chunk::End) => {
+                    self.closed = true;
+                    return None;
+                }
+                // Not a packet, so not one read: a pcapng file that carries a
+                // name-resolution block between its packets did not gain a packet.
+                Ok(Chunk::Block) => continue,
+                Ok(Chunk::Packet {
+                    linktype,
+                    timestamp,
+                    data,
+                }) => (linktype, timestamp, data),
+            };
+
+            // Counted once its link type is known to be one that can be read, so a
+            // capture refused at its first packet reports zero, and one refused at
+            // the tenth reports nine — the count says how far it got.
             self.stats.packets_read += 1;
-            let timestamp = packet.timestamp;
+            *self.stats.datalinks.entry(linktype).or_default() += 1;
+            // A classic capture stated its one link type at open; a pcapng capture
+            // states it per interface, so this is where the first answer arrives.
+            self.linktype.get_or_insert(linktype);
 
-            match gsmtap::dissect(&packet.data) {
-                Verdict::NotGsmtapContainer => {
-                    self.stats.skipped_not_udp_gsmtap += 1;
-                }
-                Verdict::Malformed => {
+            if let Some(item) = self.process_packet(&data, timestamp) {
+                return Some(item);
+            }
+        }
+    }
+}
+
+impl<R: Read> NasStream<R> {
+    /// Process a packet (data + timestamp) after link-layer validation.
+    /// Returns `Some(Item)` if a NAS event was found, or continues loop otherwise.
+    fn process_packet(&mut self, data: &[u8], timestamp: Duration) -> Option<<Self as Iterator>::Item> {
+        match gsmtap::dissect(data) {
+            Verdict::NotGsmtapContainer => {
+                self.stats.skipped_not_udp_gsmtap += 1;
+                None
+            }
+            Verdict::Malformed => {
+                self.stats.skipped_malformed += 1;
+                None
+            }
+            Verdict::OtherType { gsmtap_type } => {
+                *self.stats.gsmtap_types.entry(gsmtap_type).or_default() += 1;
+                self.stats.skipped_other_gsmtap_type += 1;
+                None
+            }
+            Verdict::Nas { payload, sub_type } => {
+                *self.stats.gsmtap_types.entry(LTE_NAS_TYPE).or_default() += 1;
+
+                let Some(kind) = SignalingKind::classify(payload, sub_type) else {
+                    // A GSMTAP frame with no identifiable message in it.
                     self.stats.skipped_malformed += 1;
-                }
-                Verdict::OtherType { gsmtap_type } => {
-                    *self.stats.gsmtap_types.entry(gsmtap_type).or_default() += 1;
-                    self.stats.skipped_other_gsmtap_type += 1;
-                }
-                Verdict::Nas { payload, sub_type } => {
-                    *self.stats.gsmtap_types.entry(LTE_NAS_TYPE).or_default() += 1;
+                    return None;
+                };
+                let payload_len = payload.len();
 
-                    let Some(kind) = SignalingKind::classify(payload, sub_type) else {
-                        // A GSMTAP frame with no identifiable message in it.
-                        self.stats.skipped_malformed += 1;
-                        continue;
-                    };
-                    let payload_len = payload.len();
-
-                    return match event_time(timestamp) {
-                        Some(timestamp) => {
-                            self.stats.events += 1;
-                            Some(Ok(SignalingEvent {
-                                timestamp,
-                                kind,
-                                payload_len,
-                            }))
-                        }
-                        None => {
-                            self.stats.failed_records += 1;
-                            Some(Err(ParseError::Timestamp {
-                                secs: timestamp.as_secs(),
-                                nsecs: timestamp.subsec_nanos(),
-                            }))
-                        }
-                    };
+                match event_time(timestamp) {
+                    Some(timestamp) => {
+                        self.stats.events += 1;
+                        Some(Ok(SignalingEvent {
+                            timestamp,
+                            kind,
+                            payload_len,
+                        }))
+                    }
+                    None => {
+                        self.stats.failed_records += 1;
+                        Some(Err(ParseError::Timestamp {
+                            secs: timestamp.as_secs(),
+                            nsecs: timestamp.subsec_nanos(),
+                        }))
+                    }
                 }
             }
         }
     }
+}
+
+/// `if_tsresol` default when an interface description omits it: microseconds, per
+/// the spec. The real capture's single interface omits it, so this is not a
+/// fallback for broken files but the common case.
+const DEFAULT_TS_RESOL: u8 = 6;
+
+/// Nanoseconds in a second: the unit every timestamp in this front-end reaches
+/// the caller in, and the numerator of every pcapng resolution ratio.
+const NS_PER_S: u128 = 1_000_000_000;
+
+/// The instant of a pcapng packet, as a span since the epoch.
+///
+/// `pcap-file` decodes the timestamp field with `Duration::from_nanos` on the
+/// file's raw integer and never reads `if_tsresol`, so it hands that integer back
+/// wearing the wrong unit. For a microsecond file — the spec's default, and every
+/// capture `rayhunter-check -P` has written — the answer is 1000 times too small:
+/// the capture lands in January 1970, which is what this front-end would have
+/// reported for the real one had the option been left unread.
+///
+/// A tick count is a full 64 bits and scaling it to nanoseconds overflows, so the
+/// arithmetic is in `u128`. Nothing below a nanosecond is kept, because an event's
+/// timestamp cannot say more than that.
+fn pcapng_timestamp(timestamp: Duration, interface: &InterfaceDescriptionBlock) -> Duration {
+    let resolution = interface
+        .options
+        .iter()
+        .find_map(|option| match option {
+            InterfaceDescriptionOption::IfTsResol(octet) => Some(*octet),
+            _ => None,
+        })
+        .unwrap_or(DEFAULT_TS_RESOL);
+
+    // What the crate left in the `Duration` is the file's tick count, unchanged.
+    let ticks = timestamp.as_nanos();
+    let (numerator, denominator) = resolution_ratio(resolution);
+    let nanos = ticks * numerator / denominator;
+
+    // A tick is at most one second wide, so scaling a tick count to seconds can
+    // only shrink it: the seconds fit the 64 bits the file's own field did, and
+    // there is no value here that needs clamping.
+    Duration::new(
+        (nanos / NS_PER_S) as u64,
+        (nanos % NS_PER_S) as u32,
+    )
+}
+
+/// A pcapng timestamp resolution as the ratio a tick count is multiplied by to
+/// become nanoseconds: `nanos = ticks * numerator / denominator`.
+///
+/// `if_tsresol` is one octet in either of two forms — with the top bit set the
+/// remaining seven bits are an exponent of two, otherwise the value is an exponent
+/// of ten — and either way it states how many seconds one tick is worth. Kept as a
+/// pair rather than one divided number because a tick finer than a nanosecond has
+/// no whole number of nanoseconds: the 10⁻¹² s of `if_tsresol = 12` is a divide by
+/// 1000, not a multiply by a tenth of one.
+fn resolution_ratio(resolution: u8) -> (u128, u128) {
+    if resolution & 0x80 != 0 {
+        // 2^-k seconds per tick. The shift reaches at most 2^127, which a `u128`
+        // holds, and the multiply above is the one that needs the width.
+        (NS_PER_S, 1_u128 << u32::from(resolution & 0x7f))
+    } else if resolution <= 9 {
+        (pow10(9 - u32::from(resolution)), 1)
+    } else {
+        (1, pow10(u32::from(resolution) - 9))
+    }
+}
+
+/// Ten to the `exponent`, saturating at what a `u128` can hold. Only a resolution
+/// past 38 gets there, and such a divisor is larger than any tick count a file can
+/// carry — so the quotient is zero, whether the true or the saturated divisor is
+/// the one used.
+fn pow10(exponent: u32) -> u128 {
+    (0..exponent).fold(1, |value, _| value.saturating_mul(10))
 }
 
 /// `pcap-file`'s errors to ours.
@@ -375,14 +640,21 @@ impl<R: Read> Iterator for NasStream<R> {
 /// thing to a caller: the capture stops mid-structure. Saying "could not read
 /// the capture" to a truncated file would send someone to check permissions
 /// rather than to wait for the rest of the bytes, so they are folded into
-/// [`ParseError::Truncated`] and every other io error keeps its own kind.
-fn pcap_error(source: PcapError) -> ParseError {
+/// [`ParseError::Truncated`] and every other io error keeps its own kind, in
+/// whichever container it was found in.
+///
+/// What is not shared is the structural error: a block whose declared lengths
+/// contradict each other is a pcapng problem and a record header is a classic one,
+/// so the last arm is named after the container the error came from rather than
+/// always saying `Pcap`.
+fn pcap_error(source: PcapError, format: Format) -> ParseError {
     match source {
         PcapError::IncompleteBuffer => ParseError::Truncated,
         PcapError::IoError(source) if source.kind() == std::io::ErrorKind::UnexpectedEof => {
             ParseError::Truncated
         }
         PcapError::IoError(source) => ParseError::Io { source },
+        other if matches!(format, Format::Pcapng) => ParseError::Pcapng { source: other },
         other => ParseError::Pcap { source: other },
     }
 }
@@ -584,14 +856,15 @@ mod tests {
     }
 
     #[test]
-    fn a_pcapng_file_is_named_not_guessed_at() {
-        // A pcapng Section Header Block: block type 0x0a0d0d0a, then its length.
+    fn a_pcapng_file_is_now_supported_but_invalid_still_errors() {
+        // A pcapng Section Header Block magic but truncated: should error as pcapng parse error
         let pcapng = [0x0a_u8, 0x0d, 0x0d, 0x0a, 0x20, 0x00, 0x00, 0x00];
         let mut stream = nas_events(&pcapng[..]);
 
         let error = expect_refusal(&mut stream);
+        // Truncated, because the block length declares a length the file does not have
         assert!(
-            matches!(error, ParseError::Pcapng { magic } if magic == PCAPNG_SECTION_HEADER),
+            matches!(error, ParseError::Truncated { .. }),
             "got {error:?}"
         );
     }
