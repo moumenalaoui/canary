@@ -1,14 +1,8 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! CANARY's cellular side: LTE signaling observations, and the input
+//! front-ends that feed them.
+//!
+//! Today the only front-end is [`rayhunter_import`], which reads the JSON
+//! emitted by the external `rayhunter-check` CLI. Native reconstruction from
+//! raw captures is not implemented yet.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod rayhunter_import;
