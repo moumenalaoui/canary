@@ -71,7 +71,7 @@ if [ "$#" -gt 0 ]; then
   captures=("$@")
 else
   python3 scripts/gen_gsmtap_pcap.py --outdir "$WORK/captures" >/dev/null
-  captures=("$WORK"/captures/*.pcap)
+  captures=("$WORK"/captures/*.pcap "$WORK"/captures/*.pcapng)
 fi
 
 # Columns, in this order, of the per-frame table tshark writes. The GSMTAP
