@@ -334,10 +334,10 @@ impl<R: Read> Iterator for NasStream<R> {
                     *self.stats.gsmtap_types.entry(gsmtap_type).or_default() += 1;
                     self.stats.skipped_other_gsmtap_type += 1;
                 }
-                Verdict::Nas { payload, secure } => {
+                Verdict::Nas { payload, sub_type } => {
                     *self.stats.gsmtap_types.entry(LTE_NAS_TYPE).or_default() += 1;
 
-                    let Some(kind) = SignalingKind::classify(payload, secure) else {
+                    let Some(kind) = SignalingKind::classify(payload, sub_type) else {
                         // A GSMTAP frame with no identifiable message in it.
                         self.stats.skipped_malformed += 1;
                         continue;
@@ -477,8 +477,10 @@ mod tests {
                     id_type: IdentityType::Imsi
                 },
                 SignalingKind::AuthenticationRequest,
+                // The frame's sub_type was 1, so the container's number is the
+                // one reported — see the classifier's rule on that.
                 SignalingKind::ProtectedNas {
-                    security_header_type: 0
+                    security_header_type: 1
                 },
             ]
         );

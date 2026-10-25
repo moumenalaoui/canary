@@ -35,10 +35,14 @@ pub const LTE_NAS_TYPE: u8 = 0x12;
 /// "RRC, a later task" rather than as an unrecognised numbering scheme.
 pub const LTE_RRC_TYPE: u8 = 0x0d;
 
-/// GSMTAP `sub_type` for LTE NAS: the payload is a plain NAS message.
+/// GSMTAP `sub_type` for LTE NAS: the payload is a plain NAS message, the only
+/// value that says so. Everything else asserts a protected payload.
 pub const NAS_SUBTYPE_PLAIN: u8 = 0x00;
 
-/// GSMTAP `sub_type` for LTE NAS: the payload is security protected.
+/// GSMTAP `sub_type` for LTE NAS: integrity protected, the first of the
+/// protected values (2 is integrity protected and ciphered, 3 ciphered with
+/// RRC signalling). A frame is protected for any non-zero value, so a reader
+/// that compared against this one alone would decode ciphertext as a header.
 pub const NAS_SUBTYPE_SECURE: u8 = 0x01;
 
 /// Smallest GSMTAP header: the fields above, i.e. `hdr_len` of 4 words.
@@ -68,10 +72,12 @@ pub enum Verdict<'a> {
         /// The NAS message, starting at its own header octet. Empty when the
         /// capture cut the frame off; the classifier reports that as malformed.
         payload: &'a [u8],
-        /// True when GSMTAP's `sub_type` flags the payload as secure. A frame
-        /// can claim this while its payload still opens with a plain header;
-        /// the claim wins, see [`crate::signaling`].
-        secure: bool,
+        /// GSMTAP's `sub_type` octet, which for LTE NAS is the container's own
+        /// statement of the NAS security header type:
+        /// [`NAS_SUBTYPE_PLAIN`] is a plain message, any other value asserts a
+        /// protected one. A frame can make that claim while its payload still
+        /// opens with a plain header; the claim wins, see [`crate::signaling`].
+        sub_type: u8,
     },
     /// A well-formed GSMTAP frame of some other radio type — `0x0d` LTE RRC,
     /// GSM, UMTS, GNSS and so on. Skipped, but worth counting by type: that is
@@ -127,7 +133,7 @@ pub fn dissect_gsmtap(frame: &[u8]) -> Verdict<'_> {
 
     Verdict::Nas {
         payload: &frame[offset..],
-        secure: header[12] == NAS_SUBTYPE_SECURE,
+        sub_type: header[12],
     }
 }
 
@@ -212,12 +218,12 @@ mod tests {
             dissect_gsmtap(&bytes),
             Verdict::Nas {
                 payload: &IDENTITY_REQUEST_IMSI,
-                secure: false,
+                sub_type: NAS_SUBTYPE_PLAIN,
             }
         );
         // And that payload reaches the signaling layer as an Identity Request.
         assert_eq!(
-            SignalingKind::classify(&IDENTITY_REQUEST_IMSI, false),
+            SignalingKind::classify(&IDENTITY_REQUEST_IMSI, 0),
             Some(SignalingKind::IdentityRequest {
                 id_type: IdentityType::Imsi
             })
@@ -233,37 +239,87 @@ mod tests {
             dissect_gsmtap(&bytes),
             Verdict::Nas {
                 payload: &payload,
-                secure: false,
+                sub_type: NAS_SUBTYPE_PLAIN,
             }
         );
         assert_eq!(
-            SignalingKind::classify(&payload, false),
+            SignalingKind::classify(&payload, 0),
             Some(SignalingKind::AuthenticationRequest)
         );
     }
 
     #[test]
     fn secure_subtype_is_carried_out_without_reading_the_body() {
-        // `sub_type` at offset 12 = 01 means secure. The body here opens with a
-        // plain Identity Request header deliberately: the framing must report
-        // the secure flag, and the classifier must not touch that body.
+        // `sub_type` at offset 12 = 1 means protected. The body here opens with
+        // a plain Identity Request header deliberately: the framing reports the
+        // container's claim, and the classifier must not touch that body.
         let payload = IDENTITY_REQUEST_IMSI.to_vec();
         let bytes = test_support::gsmtap_frame(LTE_NAS_TYPE, NAS_SUBTYPE_SECURE, &payload);
 
-        let Verdict::Nas { payload, secure } = dissect_gsmtap(&bytes) else {
+        let Verdict::Nas { payload, sub_type } = dissect_gsmtap(&bytes) else {
             panic!("expected an LTE NAS frame: {:?}", dissect_gsmtap(&bytes));
         };
-        assert!(secure, "sub_type 1 must read as secure");
+        assert_eq!(sub_type, NAS_SUBTYPE_SECURE, "the octet is carried out");
         assert_eq!(payload, IDENTITY_REQUEST_IMSI);
 
-        let kind = SignalingKind::classify(payload, secure).expect("classifiable");
+        let kind = SignalingKind::classify(payload, sub_type).expect("classifiable");
         assert_eq!(
             kind,
             SignalingKind::ProtectedNas {
-                security_header_type: 0
+                // The container's number, not the inner header's 0: the label
+                // must not read "plain" where the frame said "protected".
+                security_header_type: NAS_SUBTYPE_SECURE
             }
         );
         assert_eq!(kind.emm_code(), None, "no inner message type is decoded");
+    }
+
+    #[test]
+    fn any_subtype_but_plain_is_protected() {
+        // GSMTAP carries the NAS security header type, whose values 1, 2 and 3
+        // are integrity-protected, integrity-and-ciphered, and non-EPS
+        // bearer/NAS transport. A reader that compared against 1 alone would
+        // decode a ciphered body as a plain header and report a message type
+        // plucked from ciphertext.
+        for sub_type in [1u8, 2, 3, 7, 0xff] {
+            let bytes = test_support::gsmtap_frame(LTE_NAS_TYPE, sub_type, &IDENTITY_REQUEST_IMSI);
+            let Verdict::Nas {
+                payload,
+                sub_type: seen,
+            } = dissect_gsmtap(&bytes)
+            else {
+                panic!("expected an LTE NAS frame for sub_type {sub_type}");
+            };
+            assert_eq!(seen, sub_type);
+
+            assert_eq!(
+                SignalingKind::classify(payload, seen),
+                Some(SignalingKind::ProtectedNas {
+                    security_header_type: sub_type
+                }),
+                "sub_type {sub_type} must not be read as a plain header"
+            );
+        }
+    }
+
+    #[test]
+    fn a_header_that_calls_itself_protected_is_protected_without_a_container_claim() {
+        // sub_type 0, so the container makes no claim, but the NAS header's own
+        // nibble says integrity-protected-and-ciphered. The payload's message
+        // type at byte 1 is inside that body and is not reported.
+        let bytes =
+            test_support::gsmtap_frame(LTE_NAS_TYPE, NAS_SUBTYPE_PLAIN, &[0x27, 0x55, 0x01]);
+
+        let Verdict::Nas { payload, sub_type } = dissect_gsmtap(&bytes) else {
+            panic!("expected an LTE NAS frame");
+        };
+        assert_eq!(sub_type, NAS_SUBTYPE_PLAIN);
+        assert_eq!(
+            SignalingKind::classify(payload, sub_type),
+            Some(SignalingKind::ProtectedNas {
+                security_header_type: 2
+            })
+        );
     }
 
     #[test]
@@ -292,7 +348,7 @@ mod tests {
             dissect_gsmtap(&bytes),
             Verdict::Nas {
                 payload: &IDENTITY_REQUEST_IMSI,
-                secure: true,
+                sub_type: NAS_SUBTYPE_SECURE,
             }
         );
     }
@@ -305,11 +361,11 @@ mod tests {
             dissect_gsmtap(&bytes),
             Verdict::Nas {
                 payload: &[],
-                secure: false,
+                sub_type: NAS_SUBTYPE_PLAIN,
             }
         );
         // Which is not a message: the reader counts it as malformed.
-        assert_eq!(SignalingKind::classify(&[], false), None);
+        assert_eq!(SignalingKind::classify(&[], 0), None);
     }
 
     #[test]
@@ -350,7 +406,7 @@ mod tests {
             dissect(&test_support::ip_udp(&gsmtap, UDP_PORT)),
             Verdict::Nas {
                 payload: &IDENTITY_REQUEST_IMSI,
-                secure: false,
+                sub_type: NAS_SUBTYPE_PLAIN,
             }
         );
 
@@ -383,7 +439,7 @@ mod tests {
             dissect(&packet),
             Verdict::Nas {
                 payload: &IDENTITY_REQUEST_IMSI,
-                secure: false,
+                sub_type: NAS_SUBTYPE_PLAIN,
             }
         );
     }
@@ -402,7 +458,7 @@ mod tests {
             dissect(&ordinary),
             Verdict::Nas {
                 payload: &IDENTITY_REQUEST_IMSI,
-                secure: false,
+                sub_type: NAS_SUBTYPE_PLAIN,
             }
         );
 
