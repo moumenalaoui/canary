@@ -3,13 +3,13 @@
 version = 4
 
 [[package]]
-name = "cellular"
+name = "canary-cellular"
 version = "0.1.0"
 
 [[package]]
-name = "core"
+name = "canary-core"
 version = "0.1.0"
 
 [[package]]
-name = "network"
+name = "canary-network"
 version = "0.1.0"
