@@ -8,8 +8,14 @@
 //! - [`rayhunter_import`] reads the JSON emitted by the external
 //!   `rayhunter-check` CLI, and reports that tool's findings in CANARY's
 //!   vocabulary.
-//! - `nas_stream` (next) reconstructs the signaling sequence itself, by
-//!   streaming a PCAP capture off disk.
+//! - [`nas_stream`] reconstructs the signaling sequence itself, by streaming a
+//!   PCAP capture off disk. It reaches the NAS message through [`gsmtap`],
+//!   which knows only the container's fixed byte offsets.
 
+pub mod gsmtap;
+pub mod nas_stream;
 pub mod rayhunter_import;
 pub mod signaling;
+
+#[cfg(test)]
+mod test_support;

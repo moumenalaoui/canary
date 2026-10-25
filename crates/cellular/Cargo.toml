@@ -6,6 +6,9 @@ edition = "2024"
 [dependencies]
 canary-core = { path = "../core" }
 chrono = { version = "0.4", features = ["serde"] }
+# MIT (courvoif, 2017). Classic-PCAP reading only: `PcapReader<R: Read>` needs
+# no `Seek`, which is what lets a capture be streamed rather than opened.
+pcap-file = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
