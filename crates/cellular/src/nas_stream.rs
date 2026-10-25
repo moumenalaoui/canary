@@ -5,13 +5,13 @@
 //! NAS message, in capture order:
 //!
 //! ```text
-//! PCAP records -> raw IPv4 -> UDP/4729 -> GSMTAP v2 -> NAS message type
+//! PCAP (classic or pcapng) records -> raw IPv4 -> UDP/4729 -> GSMTAP v2 -> NAS message type
 //! ```
 //!
 //! It never holds the capture in memory. Records are pulled one at a time from a
 //! `Read`, so a multi-gigabyte capture costs the same as a small one and the
-//! same code reads a Pi's live stream: `PcapReader` needs `Read`, not `Seek`,
-//! and nothing here looks ahead or rewinds.
+//! same code reads a Pi's live stream: `PcapReader` and `PcapNgReader` need
+//! `Read`, not `Seek`, and nothing here looks ahead or rewinds.
 //!
 //! ## What is counted, and what is an error
 //!
@@ -679,7 +679,8 @@ mod tests {
     use super::*;
     use crate::signaling::IdentityType;
     use crate::test_support::{
-        Recorded, gsmtap_frame, ip_udp, pcap, pcap_big_endian, pcap_nanosecond, recorded,
+        Recorded, gsmtap_frame, ip_udp, pcap, pcap_big_endian, pcap_nanosecond,
+        pcapng, pcapng_big_endian, pcapng_nanosecond, pcapng_interfaces, recorded, recorded_on,
     };
 
     /// NAS messages, as the tests name them.
@@ -918,6 +919,9 @@ mod tests {
         for (what, bytes) in [
             ("big-endian", pcap_big_endian(&records, RAW_IPV4)),
             ("nanosecond", pcap_nanosecond(&records, RAW_IPV4)),
+            ("pcapng", pcapng(&records, RAW_IPV4)),
+            ("pcapng big-endian", pcapng_big_endian(&records, RAW_IPV4)),
+            ("pcapng nanosecond", pcapng_nanosecond(&records, RAW_IPV4)),
         ] {
             let (events, stats) = collect(&bytes);
             assert_eq!(events, expected, "{what}");
@@ -1063,5 +1067,54 @@ mod tests {
         let mut refused = nas_events(&refused_bytes[..]);
         assert_eq!(refused.linktype(), None, "a refused capture has no reader");
         expect_refusal(&mut refused);
+    }
+
+    #[test]
+    fn pcapng_multi_interface_capture() {
+        // Two interfaces: Ethernet (linktype 1) and raw IPv4 (101). Packets arriving
+        // on Ethernet must be refused, those on raw accepted.
+        let records = vec![
+            recorded_on(0, 1_700_000_000, 0, nas(0x00, &IDENTITY_REQUEST_IMSI)),
+            recorded_on(1, 1_700_000_001, 0, nas(0x00, &AUTHENTICATION_REQUEST)),
+        ];
+        let interfaces = [(1, None), (101, None)]; // Ethernet, then raw
+        let bytes = pcapng_interfaces(&records, &interfaces);
+
+        let mut stream = nas_events(&bytes[..]);
+        let error = expect_refusal(&mut stream);
+        assert!(
+            matches!(error, ParseError::UnsupportedLinkType { linktype: 1 }),
+            "got {error:?}"
+        );
+        // The first packet counted
+        assert_eq!(stream.stats().packets_read, 1);
+        assert_eq!(stream.stats().datalinks[&1], 1);
+    }
+
+    #[test]
+    fn pcapng_if_tsresol_power_of_two() {
+        // The spec's power‑of‑two branch: 2⁻⁹ seconds per tick (i.e. 512 ns).
+        let records = vec![recorded(1_700_000_000, 0, nas(0x00, &IDENTITY_REQUEST_IMSI))];
+        let interfaces = [(228, Some(0x80 | 9))]; // 2⁻⁹
+        let bytes = pcapng_interfaces(&records, &interfaces);
+        let (events, _) = collect(&bytes);
+        assert_eq!(events.len(), 1);
+        // The timestamp should be the same instant as microsecond.
+        assert_eq!(
+            events[0].timestamp.to_rfc3339(),
+            "2023-11-14T22:13:20.000000+00:00"
+        );
+    }
+
+    #[test]
+    fn pcapng_linktype_reported_per_packet() {
+        let records = vec![recorded(1_700_000_000, 0, nas(0x00, &IDENTITY_REQUEST_IMSI))];
+        let bytes = pcapng(&records, 101);
+        let mut stream = nas_events(&bytes[..]);
+        // Linktype unknown until first packet
+        assert_eq!(stream.linktype(), None);
+        let _event = stream.next().expect("event").expect("no error");
+        assert_eq!(stream.linktype(), Some(101));
+        assert_eq!(stream.stats().datalinks[&101], 1);
     }
 }
