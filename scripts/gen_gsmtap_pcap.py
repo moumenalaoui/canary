@@ -12,12 +12,16 @@ so a disagreement between the two is a fact about the format rather than about
 a shared mistake — and every one of them is readable by tshark, which is the
 third opinion (`scripts/oracle_compare.sh`).
 
-Four captures, because the front-end has duties that must not be confused:
+Seven files in four roles, because the front-end has duties that must not be
+confused:
 
-  nas.pcap     frames that must all become events: the EMM messages this model
-               names, the codes no dissector names, identity requests and
-               responses, a security-protected container, and a NAS PDU whose
-               protocol discriminator is not EMM.
+  nas.pcap     the NAS frames, every one of which must be read as NAS: the EMM
+               messages this model names, the codes no dissector names, identity
+               requests and responses, a security-protected container, and the
+               session management messages — including ones whose EPS bearer
+               identity sits in the half-octet an EMM message uses for its
+               security header type. Two of them are NAS PDUs too short to name,
+               which must count as malformed rather than as events.
   skips.pcap   traffic that must be counted and skipped, with one real NAS frame
                among it — so that a front-end which skips *everything* is caught
                by the event count rather than by a table that looks plausible.
@@ -28,6 +32,12 @@ The last two exist because a file's magic, not the reading host, decides both
 byte order and timestamp resolution: a reader that copies the sub-second field
 instead of scaling it reports 1.000000 seconds as 1000 seconds, and both files
 here hold the same instants as `nas.pcap`.
+
+`nas.pcapng`, `nas_be.pcapng` and `nas_ns.pcapng` are those same three NAS files
+in the pcapng container, where the two decisions are not in one magic number:
+the byte order is the section header's own magic and the timestamp resolution is
+an interface option (`if_tsresol`), so a reader that carried libpcap's
+assumptions over reads the same frames wrong in a different way again.
 
 Link type is 101 (RAW): the IPv4 packet starts at the first octet of the
 record's data, which is what Rayhunter's cellular captures use.
@@ -62,6 +72,11 @@ NAMED_EMM = {
 # Codes a dissector's table has no name for. CANARY reports the raw octet for
 # these, which is the honest answer and the one the oracle cannot contradict.
 UNNAMED_EMM = [0x40, 0x47, 0x65, 0x7F, 0xF1]
+
+# EPS session management messages, as (bearer identity, ESM message type) pairs.
+# The types are two of the seven a real capture produced; the bearers are the
+# ones whose octets a classifier must not mistake for a security header type.
+ESM_FRAMES = [(5, 0xC1), (7, 0xD0)]
 
 
 def checksum(data):
@@ -149,6 +164,17 @@ def identity_response(value):
     return bytes([0x07, 0x56]) + mobile_identity(value)
 
 
+def esm_message(bearer, pti=1, message_type=0xC1):
+    """An EPS session management message sent about `bearer`.
+
+    Its first octet is the EPS bearer identity in the high half and the
+    discriminator 0x2 in the low one (TS 24.301 §9.9.1.2) — the same half-octet
+    an EMM message uses for its security header type. A bearer of 5 is therefore
+    the octet `0x52`, which is not a message saying "integrity protected".
+    """
+    return bytes([(bearer << 4) | 0x02, pti, message_type])
+
+
 def record(index, packet):
     """One PCAP record, a second apart with a millisecond step between them."""
     return (1_700_000_000 + index, index * 1_000, packet)
@@ -163,6 +189,69 @@ def pcap(records, linktype=LINKTYPE_RAW, nanoseconds=False, big_endian=False):
         subsecs = micros * 1000 if nanoseconds else micros
         out += struct.pack(endian + "IIII", secs, subsecs, len(packet), len(packet))
         out += packet
+    return bytes(out)
+
+
+def pcapng(records, linktype=LINKTYPE_RAW, nanoseconds=False, big_endian=False):
+    """A pcapng file: one section, one interface, one block per record.
+
+    The two facts a libpcap magic states at once are split here, and a reader
+    has to go looking for each: byte order is whatever the section header's
+    byte-order magic says when read in the order it was written, and the
+    timestamp resolution is an option on the interface description block, whose
+    absence means microseconds. Both are stated by the same flag as in `pcap`,
+    so the two containers hold the same instants and the oracle can compare each
+    against the other's assumption.
+    """
+    endian = ">" if big_endian else "<"
+
+    def block(kind, body):
+        """Type, total length, body, total length again; lengths include all four."""
+        size = 12 + len(body)
+        return struct.pack(endian + "II", kind, size) + body + struct.pack(endian + "I", size)
+
+    # Section header: the magic, 1.0, and an unspecified section length. Its
+    # type is the four-octet palindrome 0x0A0D0D0A, which is what a reader
+    # looks for before it trusts the byte-order magic at all.
+    out = bytearray(
+        block(
+            0x0A0D_0D0A,
+            struct.pack(endian + "IHHQ", 0x1A2B_3C4D, 1, 0, 0xFFFF_FFFF_FFFF_FFFF),
+        )
+    )
+    # Interface description: link type, no MTU, snaplen, and the resolution.
+    body = struct.pack(endian + "HHI", linktype, 0, 65535)
+    if nanoseconds:
+        # if_tsresol (9) with the value 9, meaning 10^-9 seconds. Writing
+        # nanoseconds without this option says "microseconds" and moves every
+        # event a thousandfold, which is the pcapng twin of the libpcap bug.
+        body += struct.pack(endian + "HH", 9, 1) + bytes([9]) + bytes(3)
+    # An option list ends with opt_endofopt, whether or not anything preceded it.
+    out += block(0x0000_0001, body + struct.pack(endian + "HH", 0, 0))
+
+    scale = 10**9 if nanoseconds else 10**6
+    for secs, micros, packet in records:
+        stamp = secs * scale + (micros * 1000 if nanoseconds else micros)
+        # An enhanced packet block: interface id, one 64-bit timestamp in the
+        # resolution above, the two lengths, the data padded to four octets.
+        # The timestamp is two separate 32-bit fields, *most significant
+        # first*, whatever the section's order: packing it as one 64-bit integer
+        # puts the halves the wrong way round in a little-endian section, and
+        # tshark then reads 1.7e15 microseconds as the year 57041.
+        out += block(
+            0x0000_0006,
+            struct.pack(
+                endian + "IIII",
+                0,
+                stamp >> 32,
+                stamp & 0xFFFF_FFFF,
+                len(packet),
+            )
+            + struct.pack(endian + "I", len(packet))
+            + packet
+            + bytes((-len(packet)) % 4)
+            + struct.pack(endian + "HH", 0, 0),
+        )
     return bytes(out)
 
 
@@ -200,6 +289,14 @@ def nas_packets():
     # EMM message type to tally.
     frames.append(gsmtap(bytes([0x02, 0xD1, 0x3E, 0x00, 0x00, 0x00])))
     frames.append(gsmtap(bytes([0x06, 0x00])))
+
+    # ESM messages about a bearer, so the half-octet above the discriminator is
+    # non-zero: 5 and 7 are bearers here, where an EMM header would spell the
+    # same bits security header types 5 and 7. A real capture carried 361 of
+    # them in a container that said plain, and a classifier that read that
+    # nibble before the discriminator reported all 361 as integrity protected.
+    for bearer, message_type in ESM_FRAMES:
+        frames.append(gsmtap(esm_message(bearer, message_type=message_type)))
 
     # A GSMTAP header with no NAS PDU: an event of zero message, which is what
     # a radio can emit.
@@ -265,38 +362,50 @@ def main():
     # or a front-end that reads nothing at all would pass every skip test.
     skip_records.append(record(99, ipv4(udp(gsmtap(identity_request(1))))))
 
-    written = []
-    for name, data in [
-        ("nas.pcap", pcap(nas_records)),
-        ("skips.pcap", pcap(skip_records)),
-        ("nas_be.pcap", pcap(nas_records, big_endian=True)),
-        ("nas_ns.pcap", pcap(nas_records, nanoseconds=True)),
-    ]:
-        (outdir / name).write_bytes(data)
-        written.append((name, len(data)))
-
-    print(f"{'file':<14}{'bytes':>9}  contents")
-    for name, size in written:
-        print(f"{name:<14}{size:>9}  ", end="")
-        if name.startswith("skips"):
-            print(f"{len(skips)} frames to skip + 1 NAS event")
-        elif name.endswith("_be.pcap"):
-            print(f"{len(frames)} NAS frames, big-endian container")
-        elif name.endswith("_ns.pcap"):
-            print(f"{len(frames)} NAS frames, nanosecond timestamps")
-        else:
-            print(f"{len(frames)} NAS frames, all events")
-
-    # What the front-end owes for `nas.pcap`, stated here so the comparison
+    # What the front-end owes for the NAS files, stated here so the comparison
     # script has one source for the expectation.
     protected = 2
-    non_emm = 2
+    non_emm = 2 + len(ESM_FRAMES)  # unassigned discriminator, and the ESM set
     short = 2  # the zero-length and one-octet NAS PDUs
     emm = len(NAMED_EMM) + len(UNNAMED_EMM) + 16  # named, unnamed, identity req/resp
+    events = emm + protected + non_emm
+    nas = f"{len(frames)} NAS frames: {events} events, {short} malformed"
+
+    files = [
+        ("nas.pcap", pcap(nas_records), nas),
+        ("nas.pcapng", pcapng(nas_records), f"{nas}, pcapng container"),
+        ("skips.pcap", pcap(skip_records), f"{len(skips)} frames to skip + 1 NAS event"),
+        (
+            "nas_be.pcap",
+            pcap(nas_records, big_endian=True),
+            f"{nas}, big-endian container",
+        ),
+        (
+            "nas_be.pcapng",
+            pcapng(nas_records, big_endian=True),
+            f"{nas}, big-endian pcapng section",
+        ),
+        (
+            "nas_ns.pcap",
+            pcap(nas_records, nanoseconds=True),
+            f"{nas}, nanosecond timestamps",
+        ),
+        (
+            "nas_ns.pcapng",
+            pcapng(nas_records, nanoseconds=True),
+            f"{nas}, nanoseconds by if_tsresol",
+        ),
+    ]
+
+    print(f"{'file':<16}{'bytes':>9}  contents")
+    for name, data, contents in files:
+        (outdir / name).write_bytes(data)
+        print(f"{name:<16}{len(data):>9}  {contents}")
+
     print(
-        f"\nnas.pcap expectation: {len(frames)} events = "
-        f"{emm} EMM + {protected} protected + {non_emm} non-EMM; "
-        f"{short} of the EMM events carry no message type at all"
+        f"\nnas.pcap expectation: {len(frames)} frames = {events} events "
+        f"({emm} EMM + {protected} protected + {non_emm} non-EMM) + {short} too "
+        "short to name, which the front-end counts as malformed"
     )
 
 

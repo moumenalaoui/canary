@@ -18,8 +18,7 @@
 #   coverage     does tshark find NAS in the frames this front-end says it found?
 #   message type EMM counts, keyed by the message-type octet
 #   discriminator ESM counts, keyed by the protocol discriminator: what tshark
-#                named a session-management message against what CANARY called
-#                a non-EMM one
+#                read as an ESM header against what CANARY called a non-EMM one
 #   security     the header-type nibble, counted on both sides over the frames
 #                this front-end opens, because the two do not agree on when that
 #                nibble means a security header at all
@@ -37,13 +36,22 @@
 # prints them with a trailing `Z`. Frame timestamps from the file are read in
 # file order; sorting them here only orders the output.
 #
+# Each table asks tshark about the frames this front-end is able to open — a
+# GSMTAP payload type of 0x12 — and says out loud how many NAS-EPS frames that
+# excluded. A row that still reads `differs` is therefore not a known difference
+# in scope but a difference in reading, which is the whole point: leaving the
+# excluded frames inside the tables would make the biggest known divergence
+# (class 6 below) drown out the ones that matter, and on the capture measured
+# here it produced 1071 disagreement rows to say something said in one line.
+#
 # Two passes over the capture, whatever its size: one field extraction over
 # every frame, and one verbose print restricted to the frames whose EMM field
 # came back empty. A 60k-frame capture costs the same as a 39-frame one. There
 # used to be a tshark call per interesting frame, for the same two questions,
-# and on a real capture the 1822 frames with an empty EMM field made that about
-# forty minutes of re-reading the file — tshark re-dissects the whole capture to
-# answer `-Y frame.number==N`, so each call is a full pass, not a seek.
+# and on a real capture the hundreds of frames with an empty EMM field made that
+# about forty minutes of re-reading the file — tshark re-dissects the whole
+# capture to answer `-Y frame.number==N`, so each call is a full pass, not a
+# seek.
 #
 # The divergences this found, and the ones it exists to explain:
 #
@@ -51,7 +59,10 @@
 #      tshark dissects the payload anyway, reporting the message type its
 #      dissector reads out of bytes this stage refuses to interpret. tshark's
 #      count is higher; CANARY's `sht=` event is the honest one, because without
-#      the keys those bytes are ciphertext.
+#      the keys those bytes are ciphertext. The same claim in the other
+#      direction: CANARY reports the subtype as a security header type and the
+#      message itself has no such field, so the security table has a row tshark
+#      cannot match.
 #   2. A message type Wireshark's table has no name for: it prints the octet in
 #      the tree ("Unknown Message Type 0x40") and leaves the field empty, so a
 #      bare field extraction silently drops the frame. Reading the octet back out
@@ -65,17 +76,26 @@
 #      these are refused, so the disagreement table shows both verdicts.
 #   5. ESM. A NAS PDU whose protocol discriminator is not EMM has no EMM message
 #      type, and tshark's EMM field for it is whatever its dissector tried next.
-#      tshark names the ESM message in its own field, so the discriminator table
-#      can compare the two statements instead of letting them cancel out in the
-#      per-frame counts.
+#      The discriminator table compares the two statements instead of letting
+#      them cancel out in the per-frame counts.
 #   6. NAS inside RRC. A GSMTAP frame whose payload type is LTE_RRC can carry a
 #      NAS PDU inside the RRC message, and tshark dissects through the RRC layer
 #      to name it. This front-end stops at the payload type: it counts the frame
 #      as RRC and never reads the NAS inside it, because decoding the RRC layer
-#      is ASN.1 with UPER encoding and a different piece of work. So tshark
-#      calls more frames NAS-EPS than CANARY reports events, by the number of
-#      frames whose GSMTAP payload type is 0x0d; the disagreement table names
-#      those rows `gsmtap type 13` rather than counting them as a mismatch.
+#      is ASN.1 with UPER encoding and a different piece of work. The count is
+#      stated under coverage, and the frames are excluded from every table.
+#   7. The half-octet above the discriminator. An EMM message spells it its
+#      security header type and an ESM message spells it its EPS bearer identity
+#      (TS 24.301 §9.9.1.2), so tshark's `EPS bearer identity` field, not its
+#      ESM message-type field, is the like-for-like count of the headers CANARY
+#      reports as `pd=0x02`: a message type Wireshark's table has no name for is
+#      still an ESM header, and this front-end still reports its discriminator.
+#   8. ESM inside an EMM container. An EMM message such as Attach accept carries
+#      an ESM message as an information element, and tshark descends into it, so
+#      the one NAS PDU names an EMM message and an ESM header at once. CANARY
+#      reports the message, which is what the frame's discriminator octet says;
+#      those frames are taken out of the discriminator count and stay in the
+#      message-type table, where they agree.
 #
 # The disagreement table is the one that grows with the capture, so past a few
 # dozen frames it prints each distinct shape once with how many frames had it
@@ -102,9 +122,9 @@ if [ "$#" -gt 0 ]; then
   captures=("$@")
 else
   python3 scripts/gen_gsmtap_pcap.py --outdir "$WORK/captures" >/dev/null
-  # A pattern that matches nothing has to disappear, not be counted as a file:
-  # the generator writes `.pcap` today, and an unexpanded `*.pcapng` here is a
-  # capture name that tshark cannot open.
+  # A pattern that matches nothing has to disappear, not be counted as a file: an
+  # unexpanded `*.pcapng` here would be a capture name that tshark cannot open,
+  # and the front-end's verdict on it would be reported as a disagreement.
   shopt -s nullglob
   captures=("$WORK"/captures/*.pcap "$WORK"/captures/*.pcapng)
   shopt -u nullglob
@@ -115,14 +135,27 @@ fi
 # fragment flag are read here rather than re-asked per frame, because the only
 # thing that needs them is the disagreement table, and that table needs them for
 # every frame it names: per-frame it was one pass over the capture per row.
-TS=1 FRAME=2 EMM=3 ID_REQ=4 ID_RESP=5 PROTO=6 GTYPE=7 GVER=8 GHDR=9 FRAG=10 ESM=11 SHT=12
+#
+# `nas-eps.bearer_id` is the same four bits as `nas_eps.security_header_type`,
+# read from the other protocol discriminator's header, and it is set for every
+# ESM header whether or not Wireshark's table names the message inside it — which
+# is what makes it the count comparable with CANARY's `pd=0x02` events. The
+# hyphenated spelling carries the value in this build, as the underscored ones do
+# for the NAS fields above it.
+TS=1 FRAME=2 EMM=3 ID_REQ=4 ID_RESP=5 PROTO=6 GTYPE=7 GVER=8 GHDR=9 FRAG=10 ESM=11 SHT=12 BID=13
 
-# The frames whose EMM field is empty are the ones the field extraction cannot
-# answer for, and they are selected here rather than one at a time. `nas-eps`
-# and `nas_eps` are both the name of the protocol; the hyphenated spelling of
-# the field resolves but carries no value in this build, so every field below is
-# the underscored one that the packet list actually shows.
-NAS_WITHOUT_EMM_FIELD='nas-eps && !nas_eps.nas_msg_emm_type'
+# The frames the field extraction cannot answer for, and which are therefore the
+# ones worth a verbose print: a NAS PDU whose EMM field came back empty. Selected
+# in one pass rather than one at a time. `nas-eps` and `nas_eps` are both the name
+# of the protocol; the hyphenated spelling of the field resolves but carries no
+# value in this build, so every field below is the underscored one that the packet
+# list actually shows.
+#
+# The payload-type test is here because this print feeds the EMM message table and
+# nothing else: a NAS PDU inside an RRC message (class 6) is out of that table's
+# scope, and its unknown octet would otherwise be counted as a message this
+# front-end was never asked to read.
+NAS_WITHOUT_EMM_FIELD='nas-eps && !nas_eps.nas_msg_emm_type && gsmtap.type == 18'
 
 # The identity-type codes and the labels CANARY gives them, spelled out here so
 # that a rename in the model shows up as a row reading "differs" rather than as a
@@ -198,7 +231,8 @@ for capture in "${captures[@]}"; do
     -e gsmtap.hdr_len \
     -e ip.fragment \
     -e nas_eps.nas_msg_esm_type \
-    -e nas_eps.security_header_type >"$rows" 2>/dev/null
+    -e nas_eps.security_header_type \
+    -e nas-eps.bearer_id >"$rows" 2>/dev/null
 
   "$BIN" "$capture" >"$WORK/report" || true
 
@@ -208,32 +242,46 @@ for capture in "${captures[@]}"; do
   awk -F'\t' -v OFS='\t' -v ts="$TS" '{ $ts = substr($ts, 1, 26) "Z"; print }' "$rows" >"$keys"
 
   # --- message types -------------------------------------------------------
-  # Only frames tshark itself called NAS-EPS are asked for a message type: a
-  # frame it never dissected has an empty field for a reason that is not a
-  # disagreement about NAS, and counting it would blame the front-end for
-  # traffic it correctly skipped.
+  # Only the NAS-EPS frames this front-end opens are asked for a message type:
+  # payload type 0x12, a NAS PDU rather than one inside an RRC message (class 6).
+  # A frame tshark never dissected at all is left out too — its empty field says
+  # something about traffic both sides skip, not a disagreement about NAS.
   field_codes="$WORK/field_codes"
   tree_codes="$WORK/tree_codes"
-  awk -F'\t' -v e="$EMM" -v p="$PROTO" '$p ~ /NAS-EPS/ && $e != "" {
+  awk -F'\t' -v e="$EMM" -v p="$PROTO" -v g="$GTYPE" '$p ~ /NAS-EPS/ && $g == 18 && $e != "" {
     code = $e; sub(/^0x/, "", code); print "0x" tolower(code)
   }' "$keys" >"$field_codes"
 
-  # tshark names an untabled message type only in the tree, as an expert
-  # warning, so the octet has to be read back out of the verbose print. One
-  # filtered pass for all of them: the print starts a frame with `Frame N: ...`,
-  # so the octet can be attributed without re-reading the capture per frame, and
-  # only the first line of a frame counts because the same text appears again in
-  # the expert-info item below it.
+  # tshark names an untabled message type only in the tree, as an expert warning,
+  # so the octet has to be read back out of the verbose print. One filtered pass
+  # for all of them: the print starts a frame with `Frame N: ...`, so the octet can
+  # be attributed without re-reading the capture per frame, and only the first of
+  # its two lines counts, since the same text is repeated in the expert-info item
+  # below it.
+  #
+  # The protocol discriminator travels with the octet because an untabled *session
+  # management* type prints this warning too, and the number it prints is an ESM
+  # message type, which this front-end does not name at all: only the lines whose
+  # own header said 0x7 feed the EMM table. The header to read is the last one
+  # above the warning, which is the header of the message the warning is about —
+  # the distinction an ESM message inside an EMM container depends on, where one
+  # NAS PDU prints two headers.
   TZ=UTC "$TSHARK" -r "$capture" -Y "$NAS_WITHOUT_EMM_FIELD" -O nas-eps 2>/dev/null |
     awk '
       /^Frame [0-9]+:/ {
         frame = substr($2, 1, length($2) - 1)
+        pd = ""
+        next
+      }
+      /Protocol discriminator:/ {
+        if (match($0, /\(0x[0-9a-f]\)/)) pd = tolower(substr($0, RSTART + 3, 1))
         next
       }
       {
-        if (match($0, /Unknown Message Type 0x[0-9a-fA-F][0-9a-fA-F]/) && !(frame in said)) {
-          said[frame] = 1
-          print tolower(substr($0, RSTART + 21, 4))
+        if (pd != "" && match($0, /Unknown Message Type 0x[0-9a-fA-F][0-9a-fA-F]/) &&
+            !((frame SUBSEP pd) in said)) {
+          said[frame, pd] = 1
+          print pd "|" tolower(substr($0, RSTART + 21, 4))
         }
       }
     ' >"$tree_codes"
@@ -260,9 +308,12 @@ for capture in "${captures[@]}"; do
       "$tshark_nas_rrc"
   fi
 
+  emm_tree="$WORK/emm_tree"
+  awk -F'|' '$1 == 7 { print $2 }' "$tree_codes" >"$emm_tree"
+
   echo "  message type  tshark  canary"
   join -t' ' -a1 -a2 -e 0 -o '0,1.2,2.2' \
-    <(cat "$field_codes" "$tree_codes" | sort | uniq -c | awk '{ print $2, $1 }' | sort -k1,1) \
+    <(cat "$field_codes" "$emm_tree" | sort | uniq -c | awk '{ print $2, $1 }' | sort -k1,1) \
     <(canary_codes emm | sort | uniq -c | awk '{ print $2, $1 }' | sort -k1,1) |
     while read -r code t c; do
       marker=""
@@ -270,38 +321,54 @@ for capture in "${captures[@]}"; do
       printf '        %-6s %6s %6s%s\n' "$code" "$t" "$c" "$marker"
     done
 
+  opened=$(awk -F'\t' -v p="$PROTO" -v g="$GTYPE" '$p ~ /NAS-EPS/ && $g == 18 { n++ } END { print n + 0 }' "$keys")
   named=$(awk 'END { print NR }' "$field_codes")
-  empty=$(awk -F'\t' -v e="$EMM" -v p="$PROTO" '$p ~ /NAS-EPS/ && $e == "" { n++ } END { print n + 0 }' "$keys")
-  recovered=$(awk 'END { print NR }' "$tree_codes")
-  printf '  of %s NAS-EPS frame(s) tshark named %s in the message-type field and left %s empty; %s of those printed the octet in the tree as unknown, %s named nothing\n' \
-    "$tshark_nas" "$named" "$empty" "$recovered" "$((empty - recovered))"
+  recovered=$(awk 'END { print NR }' "$emm_tree")
+  esm_unknown=$(awk -F'|' '$1 != 7 { n++ } END { print n + 0 }' "$tree_codes")
+  printf '  of %s NAS-EPS frame(s) at GSMTAP type 0x12 tshark named %s in the message-type field and left %s empty; %s of those printed the octet in the tree as unknown, %s named nothing\n' \
+    "$opened" "$named" "$((opened - named))" "$recovered" "$((opened - named - recovered))"
+  if [ "$esm_unknown" -gt 0 ]; then
+    printf '  %s frame(s) printed an unknown message type under a session-management header; those octets are ESM message types, which this front-end does not name, and are not in the table above (class 7)\n' \
+      "$esm_unknown"
+  fi
 
-  # --- protocol discriminators ---------------------------------------------
-  # The non-EMM half of the same comparison. tshark has no field for the
-  # discriminator itself, only for the session-management message it named out of
-  # one, so its side of the `pd=0x02` row is the number of frames where that field
-  # came back, against CANARY's events that say the discriminator nibble is 0x02.
-  # Without this row the two statements cancel each other in the per-frame table:
-  # a frame CANARY calls non-EMM and a frame tshark calls ESM are both one NAS
-  # frame at one instant, and only the vocabulary differs — or one of them is
-  # wrong about the nibble.
+  # --- protocol discriminators ----------------------------------------------
+  # The non-EMM half of the same comparison, and the row that found the parser
+  # bug this branch fixes. tshark has no field for the protocol discriminator
+  # itself; it has a field for the message named out of an ESM header, and using
+  # that as the count left the ESM message Wireshark's table has no name for
+  # outside both tools' totals — an untabled octet looks like a frame neither read.
+  #
+  # What tshark does report for every ESM header, named or not, is the field for
+  # the other half of the same octet: `nas-eps.bearer_id`, the EPS bearer identity
+  # that TS 24.301 §9.9.1.2 puts where an EMM header puts its security header type.
+  # That is the like-for-like count of the headers CANARY reports as `pd=0x02`,
+  # and it is the reading that a nibble-ordering mistake cannot fake.
+  #
+  # Two exclusions, both counted and stated under the row: a NAS PDU inside an RRC
+  # message is out of every table here as it is out of this front-end (class 6),
+  # and an ESM message inside an EMM container IE sets the bearer identity of a
+  # frame whose own header is EMM (class 8), which CANARY reports by its EMM type —
+  # where the message-type table above is where the two agree about it.
   echo "  discriminator  tshark  canary"
-  awk -F'\t' -v p="$PROTO" -v x="$ESM" -v g="$GTYPE" '
-    $p ~ /NAS-EPS/ && $x != "" {
-      n++
-      codes[tolower($x)]++
-      # A frame whose GSMTAP payload type is not LTE NAS is NAS inside something
-      # else, and CANARY never reads past the payload type to find it.
-      if ($g != "" && $g != 18) rrc++
+  awk -F'\t' -v p="$PROTO" -v b="$BID" -v e="$EMM" -v g="$GTYPE" -v x="$ESM" '
+    $p ~ /NAS-EPS/ && $b != "" {
+      total++
+      if ($g != 18) rrc++
+      else if ($e != "") container++
+      else {
+        esm++
+        if ($x != "") { named++; codes[tolower($x)]++ }
+      }
     }
     END {
       kinds = 0
       for (k in codes) kinds++
-      print n + 0, rrc + 0, kinds
+      print total + 0, rrc + 0, container + 0, esm + 0, named + 0, kinds
     }
   ' "$keys" >"$WORK/esm_totals"
-  read -r esm_total esm_rrc esm_kinds <"$WORK/esm_totals"
-  canary_codes pd | sort | uniq -c | awk -v t="$esm_total" '
+  read -r bid_total bid_rrc bid_container bid_esm bid_named bid_kinds <"$WORK/esm_totals"
+  canary_codes pd | sort | uniq -c | awk -v t="$bid_esm" '
     { canary[$2] += $1 }
     END {
       two = canary["0x02"] + 0
@@ -312,10 +379,12 @@ for capture in "${captures[@]}"; do
           printf "        %-9s %6s %6s   no field names this discriminator\n", "pd=" k, "-", canary[k]
     }
   '
-  printf '  tshark named an ESM message in %s frame(s) across %s message code(s); %s frame(s) of those carry it inside RRC (GSMTAP type 0x0d), which this front-end does not read past\n' \
-    "$esm_total" "$esm_kinds" "$esm_rrc"
+  printf '  tshark read an EPS bearer identity, so a session-management header, in %s NAS-EPS frame(s): %s carry the NAS inside RRC (class 6) and %s carry the ESM message as an information element of an EMM one (class 8), leaving %s at GSMTAP type 0x12 for this front-end\n' \
+    "$bid_total" "$bid_rrc" "$bid_container" "$bid_esm"
+  printf '  of those %s, the ESM message inside is named by Wireshark in %s frame(s) across %s message code(s); the rest have no name in that table, and this front-end reports their discriminator either way (class 7)\n' \
+    "$bid_esm" "$bid_named" "$bid_kinds"
 
-  # --- security header types -------------------------------------------------
+  # --- security header types --------------------------------------------------
   # The container-level claim, counted on both sides, over the frames this
   # front-end actually opens: GSMTAP payload type 18. A row where one side has
   # events and the other has none is a nibble the two read as different things,
@@ -336,9 +405,19 @@ for capture in "${captures[@]}"; do
     $1 == "c" { canary[$2] += $3; seen[$2] = 1; c_total += $3; next }
     END {
       for (k = 1; k <= 15; k++)
-        if (k in seen)
-          printf "        %-6s %6s %6s%s\n", k, tshark[k] + 0, canary[k] + 0,
-            (tshark[k] + 0 == canary[k] + 0 ? "" : "   <- differs")
+        if (k in seen) {
+          # A number tshark has no field for at all can only have come from the
+          # container: the security header type of the message itself is a field,
+          # and the dissector prints it whenever the header stated one.
+          if (tshark[k] + 0 == canary[k] + 0) {
+            marker = ""
+          } else if (tshark[k] + 0 == 0) {
+            marker = "   <- the container said it, not the message"
+          } else {
+            marker = "   <- differs"
+          }
+          printf "        %-6s %6s %6s%s\n", k, tshark[k] + 0, canary[k] + 0, marker
+        }
       printf "  of the LTE NAS frames tshark dissected, %d carried a security header type in the message and canary reported %d events with one\n",
         t_total + 0, c_total + 0
     }
