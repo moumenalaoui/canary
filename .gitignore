@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/target/
+
+# Raw captures 
+*.cu8
+*.iq
+*.wav
+*.sigmf-data
+*.sigmf-meta
+*.pcap
+*.pcapng
+*.qmdl
+*.qmdl2
+
+# Sensor output
+eve.json
+*.eve.json
+conn.log
+dns.log
+*.zeek.log
+
+# Capture/working data
+/data/*
+!/data/README.md
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
