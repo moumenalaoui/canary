@@ -246,10 +246,6 @@ enum Chunk {
         timestamp: Duration,
         data: Vec<u8>,
     },
-    /// A pcapng block that is not a packet: a section's header, an interface
-    /// description, a name-resolution or statistics block. Nothing to dissect, and
-    /// not a packet, so it is not counted as one.
-    Block,
     /// The capture ended.
     End,
 }
@@ -267,13 +263,21 @@ impl<R: Read> CaptureReader<R> {
         }
     }
 
-    /// Pull the next item out of whichever container is open.
+    /// Pull the next packet out of whichever container is open.
     ///
     /// A link type is checked here rather than at open, because in pcapng the
     /// description of an interface is itself a block that has not necessarily been
     /// read yet — at open there is nothing to check. A classic file does have a
     /// global header, so `nas_events` refuses a wrong one before any packet is
     /// read, and the check here is the same rule stated once for both paths.
+    ///
+    /// A pcapng file is a stream of blocks, not of packets: section headers,
+    /// interface descriptions, name-resolution, statistics and comment blocks sit
+    /// between its Enhanced Packet Blocks, and every one that is not a packet is
+    /// passed over rather than returned. A caller cannot count what it was never
+    /// handed, so this is where "a block is not a packet" is enforced — and the
+    /// `continue`, not an error and not an end, is what keeps a capture whose
+    /// writer emitted a statistics block from reading as one that stopped there.
     fn next_item(&mut self) -> Result<Chunk, ParseError> {
         match self {
             CaptureReader::Classic { reader, linktype } => match reader.next_packet() {
@@ -482,9 +486,6 @@ impl<R: Read> Iterator for NasStream<R> {
                     self.closed = true;
                     return None;
                 }
-                // Not a packet, so not one read: a pcapng file that carries a
-                // name-resolution block between its packets did not gain a packet.
-                Ok(Chunk::Block) => continue,
                 Ok(Chunk::Packet {
                     linktype,
                     timestamp,
@@ -865,7 +866,7 @@ mod tests {
         let error = expect_refusal(&mut stream);
         // Truncated, because the block length declares a length the file does not have
         assert!(
-            matches!(error, ParseError::Truncated { .. }),
+            matches!(error, ParseError::Truncated),
             "got {error:?}"
         );
     }
@@ -1070,51 +1071,127 @@ mod tests {
     }
 
     #[test]
-    fn pcapng_multi_interface_capture() {
-        // Two interfaces: Ethernet (linktype 1) and raw IPv4 (101). Packets arriving
-        // on Ethernet must be refused, those on raw accepted.
-        let records = vec![
+    fn a_pcapng_capture_of_the_default_resolution_holds_its_own_dates() {
+        // The regression this front-end would otherwise ship: `pcap-file` hands the
+        // EPB's integer back as nanoseconds whatever the interface declared, so the
+        // microsecond file that `rayhunter-check -P` writes — the spec's default,
+        // and the one its own IDB states by omitting `if_tsresol` — would land every
+        // event 1000× early, in 1970. The real capture is exactly this file.
+        let records = [recorded(1_700_000_000, 123_456, nas(0x00, &IDENTITY_REQUEST_IMSI))];
+        let (events, _) = collect(&pcapng(&records, RAW_IPV4));
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].timestamp.to_rfc3339(),
+            "2023-11-14T22:13:20.123456+00:00",
+            "microseconds, not the raw tick count read as nanoseconds"
+        );
+    }
+
+    #[test]
+    fn a_pcapng_capture_with_two_interfaces_reads_each_packets_own() {
+        // One interface on raw IPv4, one on Ethernet. The link type is a property of
+        // the interface a packet arrived on, so the first packet is read and the
+        // second is refused for *its* link type, not the file's.
+        let records = [
             recorded_on(0, 1_700_000_000, 0, nas(0x00, &IDENTITY_REQUEST_IMSI)),
             recorded_on(1, 1_700_000_001, 0, nas(0x00, &AUTHENTICATION_REQUEST)),
         ];
-        let interfaces = [(1, None), (101, None)]; // Ethernet, then raw
-        let bytes = pcapng_interfaces(&records, &interfaces);
+        let bytes = pcapng_interfaces(&records, &[(RAW_IPV4, None), (1, None)]);
 
         let mut stream = nas_events(&bytes[..]);
-        let error = expect_refusal(&mut stream);
+        let event = stream
+            .next()
+            .expect("the readable packet yields an event")
+            .expect("no error in it");
+        assert_eq!(
+            event.kind,
+            SignalingKind::IdentityRequest {
+                id_type: IdentityType::Imsi
+            },
+            "the event is the NAS message the readable interface carried"
+        );
+        assert_eq!(stream.linktype(), Some(RAW_IPV4), "from the first packet");
+        assert_eq!(stream.stats().datalinks.get(&RAW_IPV4), Some(&1));
+
+        let error = stream
+            .next()
+            .expect("a second item, which is the refusal")
+            .expect_err("the Ethernet packet is refused, not read");
         assert!(
             matches!(error, ParseError::UnsupportedLinkType { linktype: 1 }),
             "got {error:?}"
         );
-        // The first packet counted
-        assert_eq!(stream.stats().packets_read, 1);
-        assert_eq!(stream.stats().datalinks[&1], 1);
-    }
-
-    #[test]
-    fn pcapng_if_tsresol_power_of_two() {
-        // The spec's power‑of‑two branch: 2⁻⁹ seconds per tick (i.e. 512 ns).
-        let records = vec![recorded(1_700_000_000, 0, nas(0x00, &IDENTITY_REQUEST_IMSI))];
-        let interfaces = [(228, Some(0x80 | 9))]; // 2⁻⁹
-        let bytes = pcapng_interfaces(&records, &interfaces);
-        let (events, _) = collect(&bytes);
-        assert_eq!(events.len(), 1);
-        // The timestamp should be the same instant as microsecond.
+        assert!(stream.next().is_none(), "the stream ends after the error");
         assert_eq!(
-            events[0].timestamp.to_rfc3339(),
-            "2023-11-14T22:13:20.000000+00:00"
+            stream.stats().packets_read, 1,
+            "the refused packet was never read as a packet, so it is not counted"
         );
     }
 
     #[test]
-    fn pcapng_linktype_reported_per_packet() {
-        let records = vec![recorded(1_700_000_000, 0, nas(0x00, &IDENTITY_REQUEST_IMSI))];
-        let bytes = pcapng(&records, 101);
+    fn a_pcapng_capture_may_describe_no_interface_a_packet_names() {
+        // An EPB whose `interface_id` is past the interfaces this section described.
+        // Its bytes have no link type or tick width to read them with, and guessing
+        // one would be inventing the capture's contents.
+        let records = [recorded_on(7, 1_700_000_000, 0, nas(0x00, &IDENTITY_REQUEST_IMSI))];
+        let bytes = pcapng_interfaces(&records, &[(RAW_IPV4, None)]);
+
         let mut stream = nas_events(&bytes[..]);
-        // Linktype unknown until first packet
-        assert_eq!(stream.linktype(), None);
-        let _event = stream.next().expect("event").expect("no error");
-        assert_eq!(stream.linktype(), Some(101));
-        assert_eq!(stream.stats().datalinks[&101], 1);
+        let error = expect_refusal(&mut stream);
+        assert!(
+            matches!(error, ParseError::UnknownInterface { interface: 7 }),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_pcapng_power_of_two_resolution_is_scaled_by_it_too() {
+        // The other form of `if_tsresol`: the top bit set makes the rest an exponent
+        // of two, so 0x80|9 is 2^-9 s per tick — 1.953125 ms, a rate no decimal
+        // exponent states. 8 ticks of it is 15625 µs, which a microsecond reading
+        // and a raw-nanosecond reading both get wrong.
+        let records = [recorded(1_700_000_000, 15_625, nas(0x00, &IDENTITY_REQUEST_IMSI))];
+        let bytes = pcapng_interfaces(&records, &[(RAW_IPV4, Some(0x80 | 9))]);
+        let (events, _) = collect(&bytes);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].timestamp.to_rfc3339(),
+            "2023-11-14T22:13:20.015625+00:00"
+        );
+
+        // And the decimal side of the boundary: a tick finer than a nanosecond is a
+        // divide, not a multiply. 10⁻¹² s per tick is 1000 ticks to the microsecond,
+        // so the same sub-second part is a thousand times the count — which a reader
+        // that multiplied instead would place 10⁶ away. The date is one second past
+        // the epoch because that field cannot hold a real one at this resolution.
+        let pico = pcapng_interfaces(
+            &[recorded(1, 15_625, nas(0x00, &IDENTITY_REQUEST_IMSI))],
+            &[(RAW_IPV4, Some(12))],
+        );
+        let (events, _) = collect(&pico);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].timestamp.to_rfc3339(),
+            "1970-01-01T00:00:01.015625+00:00",
+            "if_tsresol = 12 divides by 1000 rather than multiplying"
+        );
+    }
+
+    #[test]
+    fn a_pcapng_linktype_is_known_only_when_a_packet_arrives() {
+        let records = [recorded(1_700_000_000, 0, nas(0x00, &IDENTITY_REQUEST_IMSI))];
+        let bytes = pcapng(&records, RAW_IPV4);
+
+        let mut stream = nas_events(&bytes[..]);
+        assert_eq!(
+            stream.linktype(),
+            None,
+            "the IDB is a block, so a pcapng file has stated nothing at open"
+        );
+        stream.next().expect("event").expect("no error");
+        assert_eq!(stream.linktype(), Some(RAW_IPV4));
+        assert_eq!(stream.stats().datalinks.get(&RAW_IPV4), Some(&1));
     }
 }
