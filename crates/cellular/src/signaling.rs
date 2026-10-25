@@ -17,7 +17,10 @@
 //!   integrity-protected and/or ciphered with keys we do not hold. The only
 //!   honest output is [`SignalingKind::ProtectedNas`] carrying the type that
 //!   told us so. We do not look past byte 0 of such a payload, not even when the
-//!   following bytes happen to look like a plain header.
+//!   following bytes happen to look like a plain header. The message's own
+//!   assertion is only available in an EMM header: an EPS session management
+//!   message has no security header type at all, and its container is what would
+//!   have to say so.
 //! - **Reconstruction is all this stage needs.** Catcher behaviour shows up in
 //!   the *sequence* of signaling messages — an IMSI request with no preceding
 //!   authentication, repeated attach rejection — which the message types alone
@@ -152,6 +155,10 @@ pub enum SignalingKind {
         /// the 0 of a plain-looking header inside a frame that says it is
         /// protected — the octet there is ciphertext, not a header.
         ///
+        /// A message asserts this only in an EMM header. The same half-octet of
+        /// an EPS session management message is the EPS bearer identity, so a
+        /// protection claim here is never a value read from a non-EMM message.
+        ///
         /// A container's claim is reported as it was made, so a value outside
         /// 1..=3 can appear here: whatever wrote the capture said it, and this
         /// stage has nothing better to answer with. Only a number read from a
@@ -215,13 +222,17 @@ impl SignalingKind {
     /// first octet looks plain — reading a ciphered body as a plain header
     /// produces a wrong event rather than a lucky one.
     ///
+    /// The order the payload's own octet is read in matters as much as the
+    /// reading does: the discriminator is what says what the other half-octet
+    /// *is*, and only an EMM message has a security header type there.
+    ///
     /// Returns `None` only when the payload is too short to identify a message
     /// at all, which the caller counts as malformed. An unrecognised EMM type
     /// is [`SignalingKind::OtherEmm`], never an error: the type space is ours to
     /// name, not the network's to conform to.
     pub fn classify(payload: &[u8], frame_sub_type: u8) -> Option<Self> {
         let header = *payload.first()?;
-        let security_header_type = header >> 4;
+        let high_nibble = header >> 4;
         let protocol_discriminator = header & 0x0f;
 
         // The container's number is the one reported when it made a claim: the
@@ -232,15 +243,26 @@ impl SignalingKind {
                 security_header_type: frame_sub_type,
             });
         }
-        if security_header_type != SECURITY_HEADER_TYPE_PLAIN {
-            return Some(SignalingKind::ProtectedNas {
-                security_header_type,
-            });
-        }
 
+        // Read the discriminator before the other nibble, not after it: in an
+        // EMM message (0x7) the high half of this octet is the security header
+        // type, and in an EPS session management message (0x2) the same four
+        // bits are the spare half octet, where the network puts the EPS bearer
+        // identity (TS 24.301 §9.9.1.2). So an ESM message for bearer 5 arrives
+        // as `0x52`, and reading that as security header type 5 asserts a
+        // protection the message never claimed — in the capture the oracle
+        // measured, 361 of 1074 LTE NAS frames, every one of them carried in a
+        // container that said plain.
         if protocol_discriminator != EMM_PROTOCOL_DISCRIMINATOR {
             return Some(SignalingKind::NonEmm {
                 protocol_discriminator,
+            });
+        }
+
+        // Here, and only here, the high half-octet is a security header type.
+        if high_nibble != SECURITY_HEADER_TYPE_PLAIN {
+            return Some(SignalingKind::ProtectedNas {
+                security_header_type: high_nibble,
             });
         }
 
@@ -528,14 +550,88 @@ mod tests {
             assert_eq!(kind.emm_code(), None);
         }
 
-        // The security header type still wins over the discriminator: a
-        // ciphered ESM frame is Protected, because its PD octet may be fake.
+        // A protected ESM frame is Protected because the *container* says so,
+        // not because of anything in the message's own header: a ciphered body
+        // can spell any octet, and the only claim about protection that this
+        // stage will honour for a non-EMM message is the one the frame made.
         assert_eq!(
-            SignalingKind::classify(&[0x22, 0x01], 0),
+            SignalingKind::classify(&[0x22, 0x01], 1),
             Some(SignalingKind::ProtectedNas {
-                security_header_type: 2
+                security_header_type: 1
             })
         );
+        // Without that claim, `0x22` is an ESM message whose spare half-octet
+        // happens to be 2, and nothing more: see
+        // `the_security_header_type_is_only_read_from_an_emm_header`.
+        assert_eq!(
+            SignalingKind::classify(&[0x22, 0x01], 0),
+            Some(SignalingKind::NonEmm {
+                protocol_discriminator: 0x02
+            })
+        );
+    }
+
+    /// The half-octet above the protocol discriminator is a security header type
+    /// in an EMM message and the EPS bearer identity in an ESM one (TS 24.301
+    /// §9.9.1.2), so a classifier that reads it first invents protection.
+    ///
+    /// These octets are the ones a real capture produced, 361 of its 1074 LTE NAS
+    /// frames, and `scripts/oracle_compare.sh` showed the invention as a security
+    /// header type tshark's dissector had no field for. The GSMTAP `sub_type` of
+    /// every one of those frames was 0: the container said plain, so a report of
+    /// "integrity protected" contradicted the only thing that knew.
+    #[test]
+    fn the_security_header_type_is_only_read_from_an_emm_header() {
+        // ESM messages with an EPS bearer identity of 5, 6 and 7. The 0xc1 is
+        // Activate default EPS bearer context request: a session-management
+        // message type, which is not ours to decode and does not become one.
+        for header in [0x52u8, 0x62, 0x72] {
+            // Octet 2 is the procedure transaction identity and octet 3 the ESM
+            // message type; neither is read, and neither is an EMM type.
+            let payload = vec![header, 0x01, 0xc1];
+            let kind = SignalingKind::classify(&payload, 0).expect("classifiable");
+            assert_eq!(
+                kind,
+                SignalingKind::NonEmm {
+                    protocol_discriminator: 0x02
+                },
+                "octet {header:#04x} carries EPS bearer identity {}, not a protection claim",
+                header >> 4,
+            );
+            assert_eq!(kind.emm_code(), None);
+        }
+
+        // One octet is the whole message as far as this stage is concerned: the
+        // discriminator is enough to name it, and the bearer identity does not
+        // make it protected.
+        assert_eq!(
+            SignalingKind::classify(&[0x72], 0),
+            Some(SignalingKind::NonEmm {
+                protocol_discriminator: 0x02
+            })
+        );
+
+        // The same four bits in an EMM header *are* a security header type.
+        for (header, kind) in [
+            (0x07u8, SignalingKind::OtherEmm { message_type: 0x42 }),
+            (
+                0xc7,
+                SignalingKind::ProtectedNas {
+                    security_header_type: 12,
+                },
+            ),
+            (
+                0x27,
+                SignalingKind::ProtectedNas {
+                    security_header_type: 2,
+                },
+            ),
+        ] {
+            assert_eq!(
+                SignalingKind::classify(&[header, 0x42, 0x00], 0),
+                Some(kind)
+            );
+        }
     }
 
     #[test]
