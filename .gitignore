@@ -2,6 +2,14 @@
 /target/
 **/target/
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
 # Raw captures 
 *.cu8
 *.iq
