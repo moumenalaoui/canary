@@ -1,0 +1,3 @@
+# Python tooling for CANARY scripts/
+# Currently stdlib-only — no third-party dependencies yet.
+# Recreate: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt

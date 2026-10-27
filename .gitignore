@@ -36,3 +36,7 @@ dns.log
 .DS_Store
 *.swp
 .idea/
+
+# Python virtualenv
+.venv/
+venv/
